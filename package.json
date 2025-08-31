@@ -6,9 +6,9 @@
   "license": "UNLICENSED",
   "engines": { "node": ">=18" },
   "scripts": {
+    "build": "echo \"No build step for serverless functions\"",
     "dev": "vercel dev",
-    "build": "echo \"Vercel builds serverless functions; no build step required\"",
-    "start": "echo \"Use vercel dev/start; no standalone server\""
+    "start": "echo \"Use vercel dev; no standalone server\""
   },
   "dependencies": {
     "mongodb": "^6.6.0"
