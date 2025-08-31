@@ -5,11 +5,10 @@
   "description": "Pet-Portre Orders API (Vercel) – Wix → Mongo → DHL (Create/Track) → Google Sheets",
   "license": "UNLICENSED",
   "engines": { "node": ">=18" },
-  "main": "index.js",
   "scripts": {
     "dev": "vercel dev",
-    "start": "node server.js",
-    "lint": "echo \"(no lint)\""
+    "build": "echo \"Vercel builds serverless functions; no build step required\"",
+    "start": "echo \"Use vercel dev/start; no standalone server\""
   },
   "dependencies": {
     "mongodb": "^6.6.0"
