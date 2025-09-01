@@ -2,13 +2,9 @@
   "name": "pet-portre-orders",
   "version": "1.0.0",
   "private": true,
-  "description": "Pet-Portre Orders API (Vercel) – Wix → Mongo → DHL (Create/Track) → Google Sheets",
-  "license": "UNLICENSED",
-  "engines": { "node": ">=18" },
+  "description": "Pet-Portre Orders API",
   "scripts": {
-    "build": "echo \"No build step for serverless functions\"",
-    "dev": "vercel dev",
-    "start": "echo \"Use vercel dev; no standalone server\""
+    "build": "echo \"No build step for serverless functions\""
   },
   "dependencies": {
     "mongodb": "^6.6.0"
