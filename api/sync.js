@@ -1,10 +1,6 @@
-// /api/sync.js
-// Self-contained to avoid bundling/import issues (“handler is not a function”).
-// Uses ESM default export exactly like your working version.
+// api/sync.js  (CommonJS)
+const { MongoClient } = require("mongodb");
 
-import { MongoClient } from "mongodb";
-
-// Column order for row 2 (headers). “DHL Referans No” is before “Müşteri Adı”.
 const HEADERS = [
   "Sipariş No","Sipariş Tarihi","Sipariş Kanalı",
   "Tedarikçi Adı","Tedarikçi Sipariş No","Tedarikçi Kargo Firması","Tedarikçi Kargo Takip No",
@@ -18,35 +14,27 @@ const HEADERS = [
   "Sipariş Toplam Fiyat","İndirim (₺)","Para Birimi","Notlar","E-posta","Telefon"
 ];
 
-// OPTIONAL: token guard (set SYNC_TOKEN in Vercel env)
-function checkAuth(req) {
-  const token = process.env.SYNC_TOKEN;
-  if (!token) return true;
+function okToken(req) {
+  const t = process.env.SYNC_TOKEN;
+  if (!t) return true;
   const q = new URL(req.url, "http://x").searchParams;
-  return q.get("token") === token;
+  return q.get("token") === t;
 }
 
-export default async function handler(req, res) {
+module.exports = async (req, res) => {
   try {
-    if (!checkAuth(req)) {
-      return res.status(401).json({ ok: false, error: "unauthorized" });
-    }
-    if (req.method !== "GET") {
-      return res.status(405).json({ ok: false, error: "method not allowed" });
-    }
+    if (req.method !== "GET") return res.status(405).json({ ok: false, error: "method not allowed" });
+    if (!okToken(req)) return res.status(401).json({ ok: false, error: "unauthorized" });
 
     const client = new MongoClient(process.env.MONGODB_URI);
     await client.connect();
-    // Keep DB name consistent with your Atlas: pet-portre (NOT Pet-Portre-Orders)
     const db = client.db(process.env.MONGODB_DB || "pet-portre");
 
-    // Build rows: one row per line item, with defensive fallbacks so columns aren’t blank
     const rowsAgg = await db.collection("orders").aggregate([
       { $sort: { createdAt: -1 } },
       { $unwind: { path: "$items", preserveNullAndEmptyArrays: true } },
       {
         $project: {
-          // order basics
           "Sipariş No": { $ifNull: ["$orderNumber",""] },
           "Sipariş Tarihi": {
             $cond: [
@@ -57,7 +45,6 @@ export default async function handler(req, res) {
           },
           "Sipariş Kanalı": { $ifNull: ["$channel","wix"] },
 
-          // supplier
           "Tedarikçi Adı": { $ifNull: ["$supplier.name","–"] },
           "Tedarikçi Sipariş No": { $ifNull: ["$supplier.orderId","–"] },
           "Tedarikçi Kargo Firması": { $ifNull: ["$supplier.cargoCompany","–"] },
@@ -77,7 +64,6 @@ export default async function handler(req, res) {
             ]
           },
 
-          // DHL reference: official first, else placeholder, else en-dash
           "DHL Referans No": {
             $let: {
               vars: {
@@ -86,17 +72,11 @@ export default async function handler(req, res) {
               },
               in: {
                 $cond: [
-                  { $and: [
-                    { $ne: ["$$official", null] },
-                    { $ne: ["$$official", ""] }
-                  ]},
+                  { $and: [{ $ne: ["$$official", null] }, { $ne: ["$$official", ""] }] },
                   "$$official",
                   {
                     $cond: [
-                      { $and: [
-                        { $ne: ["$$placeholder", null] },
-                        { $ne: ["$$placeholder", ""] }
-                      ]},
+                      { $and: [{ $ne: ["$$placeholder", null] }, { $ne: ["$$placeholder", ""] }] },
                       "$$placeholder",
                       "–"
                     ]
@@ -106,14 +86,12 @@ export default async function handler(req, res) {
             }
           },
 
-          // customer
           "Müşteri Adı": { $ifNull: ["$customer.name",""] },
           "Adres": { $ifNull: ["$customer.address.line1",""] },
 
-          // line item (safe fallbacks)
           "SKU": { $ifNull: ["$items.sku",""] },
           "Ürün": { $ifNull: ["$items.name",""] },
-          "Adet": { $ifNull: ["$items.qty", { $literal: 1 }] },
+          "Adet": { $ifNull: ["$items.qty", 1] },
           "Birim Fiyat": { $round: [{ $ifNull: ["$items.unitPrice", 0] }, 2] },
           "Ürün Toplam Fiyat": {
             $round: [{
@@ -124,25 +102,19 @@ export default async function handler(req, res) {
             }, 2]
           },
 
-          // variants
           "Beden": { $ifNull: ["$items.variants.tshirtSize","–"] },
           "Cinsiyet": { $ifNull: ["$items.variants.gender","–"] },
           "Renk": { $ifNull: ["$items.variants.color","–"] },
           "Telefon Modeli": { $ifNull: ["$items.variants.phoneModel","–"] },
           "Tablo Boyutu": { $ifNull: ["$items.variants.portraitSize","–"] },
 
-          // payment & delivery
           "Ödeme Yöntemi": { $ifNull: ["$payment.method","paytr"] },
           "Kargo Ücreti": { $round: [{ $ifNull: ["$totals.shipping", 0] }, 2] },
           "Kargo Firması": { $ifNull: ["$delivery.courier","MNG Kargo"] },
 
-          // tracking number: force en-dash if blank
           "Kargo Takip No": {
             $cond: [
-              { $or: [
-                { $eq: ["$delivery.trackingNumber", null] },
-                { $eq: ["$delivery.trackingNumber", ""] }
-              ]},
+              { $or: [{ $eq: ["$delivery.trackingNumber", null] }, { $eq: ["$delivery.trackingNumber", ""] }] },
               "–",
               "$delivery.trackingNumber"
             ]
@@ -164,17 +136,12 @@ export default async function handler(req, res) {
             ]
           },
 
-          // totals & misc
           "Sipariş Toplam Fiyat": { $round: [{ $ifNull: ["$totals.grandTotal", 0] }, 2] },
           "İndirim (₺)": { $round: [{ $ifNull: ["$totals.discount", 0] }, 2] },
 
-          // Para Birimi — hard fallback to TRY
           "Para Birimi": {
             $cond: [
-              { $or: [
-                { $eq: ["$totals.currency", null] },
-                { $eq: ["$totals.currency", ""] }
-              ]},
+              { $or: [{ $eq: ["$totals.currency", null] }, { $eq: ["$totals.currency", ""] }] },
               "TRY",
               "$totals.currency"
             ]
@@ -189,14 +156,10 @@ export default async function handler(req, res) {
 
     await client.close();
 
-    // Keep order & shape stable; do not convert "–" to empty string
-    const orderedRows = rowsAgg.map(row =>
-      HEADERS.map(h => (row[h] !== undefined && row[h] !== null) ? row[h] : "")
-    );
-
-    res.status(200).json({ ok: true, headers: HEADERS, rows: orderedRows });
+    const orderedRows = rowsAgg.map(row => HEADERS.map(h => (row[h] ?? "")));
+    return res.status(200).json({ ok: true, headers: HEADERS, rows: orderedRows });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ ok: false, error: e.message || "internal error" });
+    return res.status(500).json({ ok: false, error: e.message || "internal error" });
   }
-}
+};
