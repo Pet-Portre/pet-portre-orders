@@ -1,72 +1,66 @@
 // api/dhl-track-order.js
-import { MongoClient } from "mongodb";
+// Works with both ESM and CJS runtimes on Vercel.
 
-const uri = process.env.MONGODB_URI;
-const dbName = process.env.MONGODB_DB || "pet-portre"; // use the DB that contains 'orders'
-// If you have a provider endpoint, put it here. We'll no-op if it's missing.
-const PROVIDER_QUERY_URL = process.env.DHL_STANDARD_QUERY_URL || "";
+const { MongoClient } = require("mongodb");
 
-function bad(res, code, msg) {
-  res.status(code).json({ ok: false, error: msg });
-}
+const URI = process.env.MONGODB_URI;
+const DB  = process.env.MONGODB_DB || "pet-portre"; // <- this is the DB that actually contains the 'orders' collection
 
-export default async function handler(req, res) {
+async function handler(req, res) {
   try {
     if (req.method !== "GET") {
-      return bad(res, 405, "method not allowed");
+      res.status(405).json({ ok: false, error: "method not allowed" });
+      return;
     }
 
-    const url = new URL(req.url, "http://x");
+    // read query params in a runtime-agnostic way
+    const url = new URL(req.url, "http://local");
     let tracking = (url.searchParams.get("tracking") || "").trim();
-    const ref = (url.searchParams.get("ref") || "").trim();
+    const ref    = (url.searchParams.get("ref") || "").trim();
 
-    // If only ref was given, try to resolve tracking from Mongo
-    if (!tracking && ref) {
+    // If only ref is provided, resolve tracking from Mongo
+    if (!tracking && ref && URI) {
       let client;
       try {
-        client = new MongoClient(uri);
+        client = new MongoClient(URI);
         await client.connect();
-        const db = client.db(dbName);
+        const db = client.db(DB);
         const doc = await db.collection("orders").findOne({
           $or: [
             { "delivery.referenceId": ref },
-            { referenceId: ref },
+            { referenceId: ref }
           ],
         });
-        tracking =
-          doc?.delivery?.trackingNumber ||
-          doc?.trackingNumber ||
-          "";
+        tracking = (doc && (doc.delivery?.trackingNumber || doc.trackingNumber)) || "";
       } finally {
         try { await client?.close(); } catch {}
       }
     }
 
+    // Always return a valid payload (your Apps Script expects this shape)
     if (!tracking) {
-      // Give Sheets a graceful response (prevents crashes)
-      return res.status(200).json({
+      res.status(200).json({
         ok: true,
         status: "UNKNOWN",
         deliveredAt: null,
         trackingNumber: "",
         note: "no tracking supplied",
       });
+      return;
     }
 
-    // If you have a live provider, do the real query here.
-    // Keeping it stubbed so the route works immediately.
-    // Example skeleton:
-    // const r = await fetch(`${PROVIDER_QUERY_URL}?tracking=${encodeURIComponent(tracking)}`, { method: "GET" });
-    // const data = await r.json(); // adapt mapping...
-
-    // Minimal, valid response shape for your Apps Script:
-    return res.status(200).json({
+    // (Optional) Call the real carrier API here. For now, echo a safe state.
+    res.status(200).json({
       ok: true,
-      status: "IN_TRANSIT",       // placeholder
-      deliveredAt: null,          // or ISO string when delivered
-      trackingNumber: tracking,   // echo back so Sheets writes it if missing
+      status: "IN_TRANSIT",
+      deliveredAt: null,
+      trackingNumber: tracking,
     });
   } catch (e) {
-    return bad(res, 500, e.message || "internal error");
+    res.status(500).json({ ok: false, error: e.message || "internal error" });
   }
 }
+
+// --- dual export to satisfy any loader ---
+module.exports = handler;           // CommonJS
+module.exports.default = handler;   // in case the wrapper looks at .default
