@@ -1,10 +1,10 @@
-// api/sync.js
-import { getDb } from "../lib/db.js";
+// /api/sync.js
+// Self-contained to avoid bundling/import issues (“handler is not a function”).
+// Uses ESM default export exactly like your working version.
 
-/**
- * Column order for row 2 (headers) — EXACTLY what your Sheet expects.
- * (DHL Referans No is placed before “Müşteri Adı” just like your previous sheet.)
- */
+import { MongoClient } from "mongodb";
+
+// Column order for row 2 (headers). “DHL Referans No” is before “Müşteri Adı”.
 const HEADERS = [
   "Sipariş No","Sipariş Tarihi","Sipariş Kanalı",
   "Tedarikçi Adı","Tedarikçi Sipariş No","Tedarikçi Kargo Firması","Tedarikçi Kargo Takip No",
@@ -18,153 +18,185 @@ const HEADERS = [
   "Sipariş Toplam Fiyat","İndirim (₺)","Para Birimi","Notlar","E-posta","Telefon"
 ];
 
-function okDash(v) {
-  // For certain cells we prefer an en-dash instead of empty string
-  return v === undefined || v === null || v === "" ? "–" : v;
-}
-function maybe(v) {
-  // For free text columns we prefer empty string when missing
-  return v === undefined || v === null ? "" : v;
-}
-function fmtDate(d, includeTime = false) {
-  if (!d) return "–";
-  try {
-    const dt = typeof d === "string" ? new Date(d) : d;
-    const tz = "Europe/Istanbul";
-    const opt = includeTime
-      ? { year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false }
-      : { year: "numeric", month: "2-digit", day: "2-digit" };
-    const s = new Intl.DateTimeFormat("tr-TR", { timeZone: tz, ...opt }).format(dt);
-    // normalize to YYYY-MM-DD or YYYY-MM-DD HH:mm
-    const [dd, mm, yyyy, hhmm] = s.match(/\d+/g) || [];
-    if (includeTime) return `${yyyy}-${mm}-${dd} ${hhmm.slice(0,2)}:${hhmm.slice(2)}`;
-    return `${yyyy}-${mm}-${dd}`;
-  } catch {
-    return "–";
-  }
-}
-
-function makeRowsFromOrder(doc) {
-  // fallbacks
-  const channel = maybe(doc.channel || "wix");
-  const orderNo = maybe(doc.orderNumber);
-  const createdAt = fmtDate(doc.createdAt, true);
-
-  const supplier = doc.supplier || {};
-  const delivery  = doc.delivery || {};
-  const customer  = doc.customer || {};
-  const totals    = doc.totals || {};
-  const payment   = doc.payment || {};
-  const notes     = maybe(doc.notes);
-
-  // DHL reference — official first, else placeholder, else en-dash
-  const dhlRef =
-    okDash(delivery.referenceId) !== "–"
-      ? delivery.referenceId
-      : okDash(delivery.referenceIdPlaceholder) !== "–"
-        ? delivery.referenceIdPlaceholder
-        : "–";
-
-  // line items: 1 row per item
-  const items = Array.isArray(doc.items) && doc.items.length ? doc.items : [ { qty: 1 } ];
-
-  const rows = items.map((it) => {
-    const v = it.variants || {};
-    const unitPrice = Number(it.unitPrice ?? 0);
-    const qty = Number(it.qty ?? 1);
-    const lineTotal = Math.round((qty * unitPrice) * 100) / 100;
-
-    return [
-      // order basics
-      orderNo,
-      createdAt,
-      channel,
-
-      // supplier
-      okDash(supplier.name),
-      okDash(supplier.orderId),
-      okDash(supplier.cargoCompany),
-      okDash(supplier.cargoTrackingNo),
-      fmtDate(supplier.givenAt),
-      fmtDate(supplier.receivedAt),
-
-      // DHL
-      dhlRef,
-
-      // customer & address
-      maybe(customer.name),
-      maybe(customer.address?.line1),
-
-      // line item
-      maybe(it.sku),
-      maybe(it.name),
-      qty,
-      Math.round(unitPrice * 100) / 100,
-      lineTotal,
-
-      // variants
-      okDash(v.tshirtSize),
-      okDash(v.gender),
-      okDash(v.color),
-      okDash(v.phoneModel),
-      okDash(v.portraitSize),
-
-      // payment & shipping
-      maybe(payment.method || "paytr"),
-      Math.round(Number(totals.shipping ?? 0) * 100) / 100,
-      maybe(delivery.courier || "MNG Kargo"),
-      okDash(delivery.trackingNumber),
-      fmtDate(delivery.cargoDispatchDate),
-      okDash(delivery.status),
-      fmtDate(delivery.dateDelivered),
-
-      // totals & misc
-      Math.round(Number(totals.grandTotal ?? 0) * 100) / 100,
-      Math.round(Number(totals.discount ?? 0) * 100) / 100,
-      maybe(totals.currency || "TRY"),
-      notes,
-      maybe(customer.email),
-      maybe(customer.phone),
-    ];
-  });
-
-  return rows;
-}
-
-function isAuthorized(req) {
-  // optional guard: set SYNC_TOKEN in Vercel env and append ?token=... from Apps Script if you want
+// OPTIONAL: token guard (set SYNC_TOKEN in Vercel env)
+function checkAuth(req) {
   const token = process.env.SYNC_TOKEN;
   if (!token) return true;
-  const q = new URL(req.url, "http://local").searchParams;
+  const q = new URL(req.url, "http://x").searchParams;
   return q.get("token") === token;
 }
 
 export default async function handler(req, res) {
   try {
-    if (!isAuthorized(req)) {
+    if (!checkAuth(req)) {
       return res.status(401).json({ ok: false, error: "unauthorized" });
     }
     if (req.method !== "GET") {
       return res.status(405).json({ ok: false, error: "method not allowed" });
     }
 
-    const db = await getDb();
-    const col = db.collection("orders");
+    const client = new MongoClient(process.env.MONGODB_URI);
+    await client.connect();
+    // Keep DB name consistent with your Atlas: pet-portre (NOT Pet-Portre-Orders)
+    const db = client.db(process.env.MONGODB_DB || "pet-portre");
 
-    // Pull all orders (newest first so your latest appear at the top in Sheets after paste)
-    const docs = await col
-      .find({}, { sort: { createdAt: -1 } })
-      .toArray();
+    // Build rows: one row per line item, with defensive fallbacks so columns aren’t blank
+    const rowsAgg = await db.collection("orders").aggregate([
+      { $sort: { createdAt: -1 } },
+      { $unwind: { path: "$items", preserveNullAndEmptyArrays: true } },
+      {
+        $project: {
+          // order basics
+          "Sipariş No": { $ifNull: ["$orderNumber",""] },
+          "Sipariş Tarihi": {
+            $cond: [
+              { $ifNull: ["$createdAt", false] },
+              { $dateToString: { date: "$createdAt", format: "%Y-%m-%d %H:%M", timezone: "Europe/Istanbul" } },
+              "–"
+            ]
+          },
+          "Sipariş Kanalı": { $ifNull: ["$channel","wix"] },
 
-    const rows = [];
-    for (const d of docs) {
-      const r = makeRowsFromOrder(d);
-      rows.push(...r);
-    }
+          // supplier
+          "Tedarikçi Adı": { $ifNull: ["$supplier.name","–"] },
+          "Tedarikçi Sipariş No": { $ifNull: ["$supplier.orderId","–"] },
+          "Tedarikçi Kargo Firması": { $ifNull: ["$supplier.cargoCompany","–"] },
+          "Tedarikçi Kargo Takip No": { $ifNull: ["$supplier.cargoTrackingNo","–"] },
+          "Tedarikçiye Veriliş Tarihi": {
+            $cond: [
+              { $ifNull: ["$supplier.givenAt", false] },
+              { $dateToString: { date: "$supplier.givenAt", format: "%Y-%m-%d", timezone: "Europe/Istanbul" } },
+              "–"
+            ]
+          },
+          "Tedarikçiden Teslim Tarihi": {
+            $cond: [
+              { $ifNull: ["$supplier.receivedAt", false] },
+              { $dateToString: { date: "$supplier.receivedAt", format: "%Y-%m-%d", timezone: "Europe/Istanbul" } },
+              "–"
+            ]
+          },
 
-    return res.status(200).json({ ok: true, headers: HEADERS, rows });
+          // DHL reference: official first, else placeholder, else en-dash
+          "DHL Referans No": {
+            $let: {
+              vars: {
+                official: "$delivery.referenceId",
+                placeholder: "$delivery.referenceIdPlaceholder"
+              },
+              in: {
+                $cond: [
+                  { $and: [
+                    { $ne: ["$$official", null] },
+                    { $ne: ["$$official", ""] }
+                  ]},
+                  "$$official",
+                  {
+                    $cond: [
+                      { $and: [
+                        { $ne: ["$$placeholder", null] },
+                        { $ne: ["$$placeholder", ""] }
+                      ]},
+                      "$$placeholder",
+                      "–"
+                    ]
+                  }
+                ]
+              }
+            }
+          },
+
+          // customer
+          "Müşteri Adı": { $ifNull: ["$customer.name",""] },
+          "Adres": { $ifNull: ["$customer.address.line1",""] },
+
+          // line item (safe fallbacks)
+          "SKU": { $ifNull: ["$items.sku",""] },
+          "Ürün": { $ifNull: ["$items.name",""] },
+          "Adet": { $ifNull: ["$items.qty", { $literal: 1 }] },
+          "Birim Fiyat": { $round: [{ $ifNull: ["$items.unitPrice", 0] }, 2] },
+          "Ürün Toplam Fiyat": {
+            $round: [{
+              $multiply: [
+                { $ifNull: ["$items.qty", 1] },
+                { $ifNull: ["$items.unitPrice", 0] }
+              ]
+            }, 2]
+          },
+
+          // variants
+          "Beden": { $ifNull: ["$items.variants.tshirtSize","–"] },
+          "Cinsiyet": { $ifNull: ["$items.variants.gender","–"] },
+          "Renk": { $ifNull: ["$items.variants.color","–"] },
+          "Telefon Modeli": { $ifNull: ["$items.variants.phoneModel","–"] },
+          "Tablo Boyutu": { $ifNull: ["$items.variants.portraitSize","–"] },
+
+          // payment & delivery
+          "Ödeme Yöntemi": { $ifNull: ["$payment.method","paytr"] },
+          "Kargo Ücreti": { $round: [{ $ifNull: ["$totals.shipping", 0] }, 2] },
+          "Kargo Firması": { $ifNull: ["$delivery.courier","MNG Kargo"] },
+
+          // tracking number: force en-dash if blank
+          "Kargo Takip No": {
+            $cond: [
+              { $or: [
+                { $eq: ["$delivery.trackingNumber", null] },
+                { $eq: ["$delivery.trackingNumber", ""] }
+              ]},
+              "–",
+              "$delivery.trackingNumber"
+            ]
+          },
+
+          "Kargoya Veriliş Tarihi": {
+            $cond: [
+              { $ifNull: ["$delivery.cargoDispatchDate", false] },
+              { $dateToString: { date: "$delivery.cargoDispatchDate", format: "%Y-%m-%d", timezone: "Europe/Istanbul" } },
+              "–"
+            ]
+          },
+          "Teslimat Durumu": { $ifNull: ["$delivery.status","–"] },
+          "Teslimat Tarihi": {
+            $cond: [
+              { $ifNull: ["$delivery.dateDelivered", false] },
+              { $dateToString: { date: "$delivery.dateDelivered", format: "%Y-%m-%d", timezone: "Europe/Istanbul" } },
+              "–"
+            ]
+          },
+
+          // totals & misc
+          "Sipariş Toplam Fiyat": { $round: [{ $ifNull: ["$totals.grandTotal", 0] }, 2] },
+          "İndirim (₺)": { $round: [{ $ifNull: ["$totals.discount", 0] }, 2] },
+
+          // Para Birimi — hard fallback to TRY
+          "Para Birimi": {
+            $cond: [
+              { $or: [
+                { $eq: ["$totals.currency", null] },
+                { $eq: ["$totals.currency", ""] }
+              ]},
+              "TRY",
+              "$totals.currency"
+            ]
+          },
+
+          "Notlar": { $ifNull: ["$notes",""] },
+          "E-posta": { $ifNull: ["$customer.email",""] },
+          "Telefon": { $ifNull: ["$customer.phone",""] }
+        }
+      }
+    ]).toArray();
+
+    await client.close();
+
+    // Keep order & shape stable; do not convert "–" to empty string
+    const orderedRows = rowsAgg.map(row =>
+      HEADERS.map(h => (row[h] !== undefined && row[h] !== null) ? row[h] : "")
+    );
+
+    res.status(200).json({ ok: true, headers: HEADERS, rows: orderedRows });
   } catch (e) {
     console.error(e);
-    return res.status(500).json({ ok: false, error: e.message || "internal error" });
+    res.status(500).json({ ok: false, error: e.message || "internal error" });
   }
 }
