@@ -1,45 +1,39 @@
-// Create DHL order for a given orderNumber, update Mongo with official referenceId/tracking no.
-const { ObjectId } = require('mongodb');
-const { getDB } = require('../lib/db');
-const { createOrder } = require('../lib/dhl');
+import { getDb } from "../lib/db";
 
-function nowISO(){return new Date().toISOString();}
+// Accepts POST { referenceId, receiver{...}, order{...} }
+export default async function handler(req, res) {
+  if (req.method !== "POST") return res.status(405).json({ ok: false, error: "Method not allowed" });
 
-module.exports = async (req, res) => {
-  if (req.method !== 'POST') {
-    res.status(405).json({ ok:false, error:'Method not allowed' }); return;
-  }
   try {
-    const db = await getDB();
-    const body = typeof req.body==='object'?req.body:JSON.parse(req.body||'{}');
-    const { orderNumber, id } = body;
+    const payload = req.body || {};
+    const ref = (payload.referenceId || "").toString();
+    if (!ref) return res.status(400).json({ ok: false, error: "referenceId required" });
 
-    let order = orderNumber
-      ? await db.collection('orders').findOne({ orderNumber: String(orderNumber) })
-      : id ? await db.collection('orders').findOne({ _id:new ObjectId(String(id)) }) : null;
+    // TODO: call DHL/MNG create-order here if you want server-side creation.
+    // For now we just store reference placeholder and echo success.
 
-    if (!order) { res.status(404).json({ ok:false, error:'Order not found' }); return; }
+    const db = await getDb();
+    await db.collection("orders").updateOne(
+      { channel: { $in: ["wix", "trendyol"] }, orderNumber: payload.order?.orderNumber || "__unknown__" },
+      {
+        $set: {
+          "delivery.referenceIdPlaceholder": ref,
+          "delivery.courier": "MNG Kargo",
+          "delivery.status": "CREATED",
+          updatedAt: new Date()
+        }
+      },
+      { upsert: false }
+    );
 
-    const result = await createOrder(order);
-
-    const update = {
-      'delivery.courier': 'DHL',
-      updatedAt: nowISO()
-    };
-    if (result.referenceId) update['delivery.referenceId']=result.referenceId;
-    if (result.trackingNumber) update['delivery.trackingNumber']=result.trackingNumber;
-
-    await db.collection('orders').updateOne({ _id: order._id },{ $set:update });
-
-    res.json({
-      ok:true,
-      orderNumber: order.orderNumber,
-      referenceId: result.referenceId || order.delivery?.referenceId || order.delivery?.referenceIdPlaceholder,
-      trackingNumber: result.trackingNumber || null,
-      raw: result.data
+    return res.status(200).json({
+      ok: true,
+      referenceId: ref,
+      carrier: "MNG Kargo",
+      trackingNumber: ""
     });
-  } catch(err){
-    console.error('dhl create-order error', err);
-    res.status(500).json({ ok:false, error:String(err.message||err) });
+  } catch (e) {
+    console.error("dhl-create-order error:", e);
+    return res.status(500).json({ ok: false, error: e.message });
   }
-};
+}
