@@ -1,34 +1,61 @@
-// Fetches a PDF label from MNG's label endpoint, returns base64
-export default async function handler(req, res) {
+// api/dhl-track-order.js
+const { MongoClient } = require("mongodb");
+
+const URI = process.env.MONGODB_URI;
+const DB  = process.env.MONGODB_DB || "pet-portre"; // use the DB that actually has your 'orders' collection
+
+module.exports = async (req, res) => {
   try {
-    const ref = (req.query?.ref || "").toString();
-    if (!ref) return res.status(400).json({ ok: false, error: "ref required" });
-
-    const url = process.env.DHL_LABEL_URL_PROD || process.env.DHL_LABEL_URL;
-    if (!url) return res.status(500).json({ ok: false, error: "DHL_LABEL_URL missing" });
-
-    const resp = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ referenceId: ref })
-    });
-
-    if (!resp.ok) {
-      const t = await resp.text();
-      return res.status(resp.status).json({ ok: false, error: `Label API ${resp.status}: ${t}` });
+    if (req.method !== "GET") {
+      res.status(405).json({ ok: false, error: "method not allowed" });
+      return;
     }
 
-    // Assume endpoint returns PDF bytes
-    const buf = Buffer.from(await resp.arrayBuffer());
-    const pdfBase64 = buf.toString("base64");
+    // read query params
+    const url = new URL(req.url, "http://x");
+    let tracking = (url.searchParams.get("tracking") || "").trim();
+    const ref   = (url.searchParams.get("ref") || "").trim();
 
-    return res.status(200).json({
+    // if no tracking but we have a ref, resolve from Mongo
+    if (!tracking && ref && URI) {
+      let client;
+      try {
+        client = new MongoClient(URI);
+        await client.connect();
+        const db = client.db(DB);
+        const doc = await db.collection("orders").findOne({
+          $or: [
+            { "delivery.referenceId": ref },
+            { referenceId: ref },
+          ],
+        });
+        tracking =
+          (doc && (doc.delivery?.trackingNumber || doc.trackingNumber)) || "";
+      } finally {
+        try { await client?.close(); } catch {}
+      }
+    }
+
+    // always return a valid shape for your Google Sheet
+    if (!tracking) {
+      res.status(200).json({
+        ok: true,
+        status: "UNKNOWN",
+        deliveredAt: null,
+        trackingNumber: "",
+        note: "no tracking supplied",
+      });
+      return;
+    }
+
+    // provider call can be added later; echo a safe response now
+    res.status(200).json({
       ok: true,
-      fileName: `label-${ref}`,
-      pdfBase64
+      status: "IN_TRANSIT",
+      deliveredAt: null,
+      trackingNumber: tracking,
     });
   } catch (e) {
-    console.error("dhl-label error:", e);
-    return res.status(500).json({ ok: false, error: e.message });
+    res.status(500).json({ ok: false, error: e.message || "internal error" });
   }
-}
+};
