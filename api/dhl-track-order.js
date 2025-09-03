@@ -1,24 +1,21 @@
-// api/dhl-track-order.js
-// Works with both ESM and CJS runtimes on Vercel.
-
-const { MongoClient } = require("mongodb");
+// api/dhl-track-order.js  (ESM default export; Vercel will call this)
+import { MongoClient } from "mongodb";
 
 const URI = process.env.MONGODB_URI;
-const DB  = process.env.MONGODB_DB || "pet-portre"; // <- this is the DB that actually contains the 'orders' collection
+const DB  = process.env.MONGODB_DB || "pet-portre"; // this is the DB that actually holds your 'orders' collection
 
-async function handler(req, res) {
+export default async function handler(req, res) {
   try {
     if (req.method !== "GET") {
       res.status(405).json({ ok: false, error: "method not allowed" });
       return;
     }
 
-    // read query params in a runtime-agnostic way
     const url = new URL(req.url, "http://local");
     let tracking = (url.searchParams.get("tracking") || "").trim();
     const ref    = (url.searchParams.get("ref") || "").trim();
 
-    // If only ref is provided, resolve tracking from Mongo
+    // If the caller only gave ?ref=, try to resolve a tracking number from Mongo
     if (!tracking && ref && URI) {
       let client;
       try {
@@ -29,38 +26,33 @@ async function handler(req, res) {
           $or: [
             { "delivery.referenceId": ref },
             { referenceId: ref }
-          ],
+          ]
         });
-        tracking = (doc && (doc.delivery?.trackingNumber || doc.trackingNumber)) || "";
+        tracking = doc?.delivery?.trackingNumber || doc?.trackingNumber || "";
       } finally {
         try { await client?.close(); } catch {}
       }
     }
 
-    // Always return a valid payload (your Apps Script expects this shape)
+    // Always respond with a safe shape your Apps Script expects
     if (!tracking) {
       res.status(200).json({
         ok: true,
         status: "UNKNOWN",
         deliveredAt: null,
-        trackingNumber: "",
-        note: "no tracking supplied",
+        trackingNumber: ""
       });
       return;
     }
 
-    // (Optional) Call the real carrier API here. For now, echo a safe state.
+    // (Hook to real carrier tracking here if/when you want)
     res.status(200).json({
       ok: true,
       status: "IN_TRANSIT",
       deliveredAt: null,
-      trackingNumber: tracking,
+      trackingNumber: tracking
     });
   } catch (e) {
-    res.status(500).json({ ok: false, error: e.message || "internal error" });
+    res.status(500).json({ ok: false, error: e?.message || "internal error" });
   }
 }
-
-// --- dual export to satisfy any loader ---
-module.exports = handler;           // CommonJS
-module.exports.default = handler;   // in case the wrapper looks at .default
