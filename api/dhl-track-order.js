@@ -1,15 +1,15 @@
 // api/dhl-track-order.js
-// Works on Vercel Node runtime even if your project mixes ESM/CJS.
-// Exports both a default ESM handler and (when available) a CJS module.exports.
+// Max-compat: supports default export, CJS, and AWS-style exports.handler.
 
 import { MongoClient } from "mongodb";
 
 const URI = process.env.MONGODB_URI;
-const DB  = process.env.MONGODB_DB || "pet-portre"; // <-- this is the DB that holds your 'orders' collection
+const DB  = process.env.MONGODB_DB || "pet-portre"; // this is the database name that contains 'orders'
 
-async function handler(req, res) {
+// The real logic
+async function coreHandler(req, res) {
   try {
-    // Node-style guard (Vercel Node runtime passes req/res)
+    // Node/Express shape
     if (req && res && typeof res.status === "function") {
       if (req.method !== "GET") {
         res.status(405).json({ ok: false, error: "method not allowed" });
@@ -20,7 +20,7 @@ async function handler(req, res) {
       let tracking = (url.searchParams.get("tracking") || "").trim();
       const ref    = (url.searchParams.get("ref") || "").trim();
 
-      // Resolve tracking by ref (from Mongo) if needed
+      // If only ref is given, try to resolve tracking from Mongo
       if (!tracking && ref && URI) {
         let client;
         try {
@@ -39,7 +39,6 @@ async function handler(req, res) {
         }
       }
 
-      // Always return a safe shape
       if (!tracking) {
         res.status(200).json({
           ok: true,
@@ -50,6 +49,7 @@ async function handler(req, res) {
         return;
       }
 
+      // TODO: call your real carrier API here; stubbed for now:
       res.status(200).json({
         ok: true,
         status: "IN_TRANSIT",
@@ -59,14 +59,11 @@ async function handler(req, res) {
       return;
     }
 
-    // Fallback for environments that expect a web Response (shouldn't be needed on Vercel Node)
-    const ok = {
-      ok: true,
-      status: "UNKNOWN",
-      deliveredAt: null,
-      trackingNumber: ""
-    };
-    return new Response(JSON.stringify(ok), { status: 200, headers: { "content-type": "application/json" } });
+    // Fetch/Web style fallback (rare on Vercel Node, but safe)
+    const url = new URL(req.url);
+    const body = { ok: true, status: "UNKNOWN", deliveredAt: null, trackingNumber: url.searchParams.get("tracking") || "" };
+    return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+
   } catch (e) {
     if (res && typeof res.status === "function") {
       res.status(500).json({ ok: false, error: e?.message || "internal error" });
@@ -79,10 +76,19 @@ async function handler(req, res) {
   }
 }
 
-// ESM default export
-export default handler;
+// ---- Export in every shape the launcher might expect ----
 
-// CJS export when available (avoids ReferenceError in ESM)
-if (typeof module !== "undefined") {
-  module.exports = handler;
-}
+// ESM default (Vercel Node prefers this)
+export default coreHandler;
+
+// CJS default (older launchers)
+try {
+  // module is undefined under pure ESM, so guard:
+  if (typeof module !== "undefined") {
+    module.exports = coreHandler;
+    // AWS-style symbol some launchers look for:
+    module.exports.handler = coreHandler;
+    // Also put a named export on exports just in case:
+    exports.handler = coreHandler;
+  }
+} catch { /* noop */ }
