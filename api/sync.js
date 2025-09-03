@@ -1,125 +1,170 @@
-// Returns headers + rows for Google Sheets
-// Reads from MongoDB collection: "orders"
+import { getDb } from "../lib/db";
 
-const { connectToDatabase } = require('../lib/db');
-
-// Header list (TR [EN]) — row order matters
+/**
+ * Headers in the order your Sheet uses (row 2).
+ * “DHL Referans No” is placed before “Müşteri Adı” as you requested.
+ */
 const HEADERS = [
-  // A) Store (Wix)
-  'Sipariş No',                 // [Order No]
-  'Sipariş Tarihi',             // [Order Date]
-  'Sipariş Kanalı',             // [Sales Channel]
-  'Müşteri Adı',                // [Customer Name]
-  'Adres',                      // [Address]
-  'SKU',                        // [SKU]
-  'Ürün',                       // [Product]
-  'Adet',                       // [Quantity]
-  'Birim Fiyat',                // [Unit Price]
-  'Ürün Toplam Fiyat',          // [Product Line Total]
-  'Beden',                      // [Size]
-  'Cinsiyet',                   // [Gender]
-  'Renk',                       // [Color]
-  'Telefon Modeli',             // [Phone Model]
-  'Tablo Boyutu',               // [Canvas Size]
-  'Ödeme Yöntemi',              // [Payment Method]
-  'Sipariş Toplam Fiyat',       // [Order Total]
-  'İndirim (₺)',                // [Discount]
-  'Para Birimi',                // [Currency]
-  'E-posta',                    // [Email]
-  'Telefon',                    // [Phone]
-
-  // B) Supplier (internal/inbound)
-  'Tedarikçi Adı',              // [Supplier Name]
-  'Tedarikçi Sipariş No',       // [Supplier PO No]
-  'Tedarikçi Kargo Firması',    // [Supplier Carrier]
-  'Tedarikçi Kargo Takip No',   // [Supplier Tracking No]
-  'Tedarikçiye Veriliş Tarihi', // [Date Given to Supplier]
-  'Tedarikçiden Teslim Tarihi', // [Date Received from Supplier]
-
-  // C) Customer shipping (MNG)
-  'Kargo Firması',              // [Carrier]
-  'Kargo Takip No',             // [Tracking No]
-  'Kargoya Veriliş Tarihi',     // [Handed to Carrier Date]
-  'Teslimat Durumu',            // [Delivery Status]
-  'Teslimat Tarihi',            // [Delivery Date]
-  'DHL Referans No',            // [Carrier Reference / Our Reference]
-
-  // D) Cost / notes
-  'Kargo Ücreti',               // [Shipping Cost]
-  'Notlar'                      // [Notes]
+  "Sipariş No","Sipariş Tarihi","Sipariş Kanalı",
+  "Tedarikçi Adı","Tedarikçi Sipariş No","Tedarikçi Kargo Firması","Tedarikçi Kargo Takip No",
+  "Tedarikçiye Veriliş Tarihi","Tedarikçiden Teslim Tarihi",
+  "DHL Referans No",
+  "Müşteri Adı","Adres",
+  "SKU","Ürün","Adet","Birim Fiyat","Ürün Toplam Fiyat",
+  "Beden","Cinsiyet","Renk","Telefon Modeli","Tablo Boyutu",
+  "Ödeme Yöntemi","Kargo Ücreti","Kargo Firması","Kargo Takip No",
+  "Kargoya Veriliş Tarihi","Teslimat Durumu","Teslimat Tarihi",
+  "Sipariş Toplam Fiyat","İndirim (₺)","Para Birimi","Notlar","E-posta","Telefon"
 ];
 
-// Helper to read nested props safely
-const g = (obj, path, fallback = '') => {
+const EN_DASH = "–";
+
+export default async function handler(req, res) {
   try {
-    return path.split('.').reduce((o, k) => (o && o[k] !== undefined ? o[k] : undefined), obj) ?? fallback;
-  } catch {
-    return fallback;
+    const db = await getDb();
+
+    // One row per line item
+    const rows = await db.collection("orders").aggregate([
+      { $unwind: { path: "$items", preserveNullAndEmptyArrays: true } },
+      {
+        $project: {
+          // order basics
+          "Sipariş No": "$orderNumber",
+          "Sipariş Tarihi": {
+            $cond: [
+              { $ifNull: ["$createdAt", false] },
+              { $dateToString: { date: "$createdAt", format: "%Y-%m-%d %H:%M", timezone: "Europe/Istanbul" } },
+              EN_DASH
+            ]
+          },
+          "Sipariş Kanalı": "$channel",
+
+          // supplier block (optional)
+          "Tedarikçi Adı": { $ifNull: ["$supplier.name", EN_DASH] },
+          "Tedarikçi Sipariş No": { $ifNull: ["$supplier.orderId", EN_DASH] },
+          "Tedarikçi Kargo Firması": { $ifNull: ["$supplier.cargoCompany", EN_DASH] },
+          "Tedarikçi Kargo Takip No": { $ifNull: ["$supplier.cargoTrackingNo", EN_DASH] },
+          "Tedarikçiye Veriliş Tarihi": {
+            $cond: [
+              { $ifNull: ["$supplier.givenAt", false] },
+              { $dateToString: { date: "$supplier.givenAt", format: "%Y-%m-%d", timezone: "Europe/Istanbul" } },
+              EN_DASH
+            ]
+          },
+          "Tedarikçiden Teslim Tarihi": {
+            $cond: [
+              { $ifNull: ["$supplier.receivedAt", false] },
+              { $dateToString: { date: "$supplier.receivedAt", format: "%Y-%m-%d", timezone: "Europe/Istanbul" } },
+              EN_DASH
+            ]
+          },
+
+          // DHL Referans logic: prefer official, else placeholder, else en-dash
+          "DHL Referans No": {
+            $cond: [
+              { $and: [
+                { $ne: ["$delivery.referenceId", null] },
+                { $ne: ["$delivery.referenceId", ""] }
+              ]},
+              "$delivery.referenceId",
+              {
+                $cond: [
+                  { $and: [
+                    { $ne: ["$delivery.referenceIdPlaceholder", null] },
+                    { $ne: ["$delivery.referenceIdPlaceholder", ""] }
+                  ]},
+                  "$delivery.referenceIdPlaceholder",
+                  EN_DASH
+                ]
+              }
+            ]
+          },
+
+          // customer
+          "Müşteri Adı": { $ifNull: ["$customer.name", ""] },
+          "Adres": {
+            $trim: {
+              input: {
+                $concat: [
+                  { $ifNull: ["$customer.address.line1", ""] },
+                  " ",
+                  { $ifNull: ["$customer.address.city", ""] },
+                  " ",
+                  { $ifNull: ["$customer.address.postcode", ""] }
+                ]
+              }
+            }
+          },
+
+          // line item
+          "SKU": "$items.sku",
+          "Ürün": "$items.name",
+          "Adet": "$items.qty",
+          "Birim Fiyat": { $round: ["$items.unitPrice", 2] },
+          "Ürün Toplam Fiyat": { $round: [{ $multiply: ["$items.qty", "$items.unitPrice"] }, 2] },
+
+          // variants
+          "Beden": { $ifNull: ["$items.variants.tshirtSize", EN_DASH] },
+          "Cinsiyet": { $ifNull: ["$items.variants.gender", EN_DASH] },
+          "Renk": { $ifNull: ["$items.variants.color", EN_DASH] },
+          "Telefon Modeli": { $ifNull: ["$items.variants.phoneModel", EN_DASH] },
+          "Tablo Boyutu": { $ifNull: ["$items.variants.portraitSize", EN_DASH] },
+
+          // payment, delivery
+          "Ödeme Yöntemi": { $ifNull: ["$payment.method", "paytr"] },
+          "Kargo Ücreti": { $round: [{ $ifNull: ["$totals.shipping", 0] }, 2] },
+          "Kargo Firması": { $ifNull: ["$delivery.courier", EN_DASH] },
+          "Kargo Takip No": {
+            $cond: [
+              { $and: [
+                { $ne: ["$delivery.trackingNumber", null] },
+                { $ne: ["$delivery.trackingNumber", ""] }
+              ]},
+              "$delivery.trackingNumber",
+              EN_DASH
+            ]
+          },
+          "Kargoya Veriliş Tarihi": {
+            $cond: [
+              { $ifNull: ["$delivery.cargoDispatchDate", false] },
+              { $dateToString: { date: "$delivery.cargoDispatchDate", format: "%Y-%m-%d", timezone: "Europe/Istanbul" } },
+              EN_DASH
+            ]
+          },
+          "Teslimat Durumu": { $ifNull: ["$delivery.status", EN_DASH] },
+          "Teslimat Tarihi": {
+            $cond: [
+              { $ifNull: ["$delivery.dateDelivered", false] },
+              { $dateToString: { date: "$delivery.dateDelivered", format: "%Y-%m-%d", timezone: "Europe/Istanbul" } },
+              EN_DASH
+            ]
+          },
+
+          // totals & misc
+          "Sipariş Toplam Fiyat": { $round: [{ $ifNull: ["$totals.grandTotal", 0] }, 2] },
+          "İndirim (₺)": { $round: [{ $ifNull: ["$totals.discount", 0] }, 2] },
+          "Para Birimi": {
+            $cond: [
+              { $or: [
+                { $eq: ["$totals.currency", null] },
+                { $eq: ["$totals.currency", ""] }
+              ]},
+              "TRY",
+              "$totals.currency"
+            ]
+          },
+          "Notlar": { $ifNull: ["$notes", ""] },
+          "E-posta": { $ifNull: ["$customer.email", ""] },
+          "Telefon": { $ifNull: ["$customer.phone", ""] }
+        }
+      },
+      { $sort: { createdAt: -1, orderNumber: -1 } }
+    ]).toArray();
+
+    const orderedRows = rows.map(row => HEADERS.map(h => (row[h] ?? "")));
+    return res.status(200).json({ ok: true, headers: HEADERS, rows: orderedRows });
+  } catch (e) {
+    console.error("sync error:", e);
+    return res.status(500).json({ ok: false, error: e.message });
   }
-};
-
-module.exports = async (req, res) => {
-  try {
-    const { db } = await connectToDatabase();
-    const col = db.collection('orders'); // collection name
-
-    // You can filter/limit here if you like
-    const docs = await col.find({}).sort({ createdAt: -1 }).limit(1000).toArray();
-
-    // Map docs -> rows matching HEADERS order
-    const rows = docs.map((d) => ([
-      // A) Wix
-      g(d, 'orderNo'),                           // Sipariş No
-      g(d, 'orderDate'),                         // Sipariş Tarihi
-      g(d, 'channel'),                           // Sipariş Kanalı
-      g(d, 'customer.name') || g(d, 'customerName'), // Müşteri Adı
-      g(d, 'shipping.address') || g(d, 'address'),   // Adres
-      g(d, 'item.sku') || g(d, 'sku'),           // SKU
-      g(d, 'item.name') || g(d, 'product'),      // Ürün
-      g(d, 'item.qty') || g(d, 'quantity'),      // Adet
-      g(d, 'item.unitPrice') || g(d, 'unitPrice'),   // Birim Fiyat
-      g(d, 'item.lineTotal') || g(d, 'lineTotal'),   // Ürün Toplam Fiyat
-      g(d, 'options.size') || g(d, 'size'),      // Beden
-      g(d, 'options.gender') || g(d, 'gender'),  // Cinsiyet
-      g(d, 'options.color') || g(d, 'color'),    // Renk
-      g(d, 'options.phoneModel') || g(d, 'phoneModel'), // Telefon Modeli
-      g(d, 'options.canvasSize') || g(d, 'canvasSize'), // Tablo Boyutu
-      g(d, 'payment.method') || g(d, 'paymentMethod'),  // Ödeme Yöntemi
-      g(d, 'totals.orderTotal') || g(d, 'orderTotal'),  // Sipariş Toplam Fiyat
-      g(d, 'totals.discount') || g(d, 'discount'),      // İndirim (₺)
-      g(d, 'currency') || 'TRY',                    // Para Birimi
-      g(d, 'customer.email') || g(d, 'email'),      // E-posta
-      g(d, 'customer.phone') || g(d, 'phone'),      // Telefon
-
-      // B) Supplier
-      g(d, 'supplier.name'),                        // Tedarikçi Adı
-      g(d, 'supplier.poNumber'),                    // Tedarikçi Sipariş No
-      g(d, 'supplier.carrier'),                     // Tedarikçi Kargo Firması
-      g(d, 'supplier.trackingNo'),                  // Tedarikçi Kargo Takip No
-      g(d, 'supplier.handedAt'),                    // Tedarikçiye Veriliş Tarihi
-      g(d, 'supplier.receivedAt'),                  // Tedarikçiden Teslim Tarihi
-
-      // C) Customer shipping (MNG)
-      g(d, 'shipping.carrier') || 'MNG Kargo',      // Kargo Firması
-      g(d, 'shipping.trackingNo') || g(d, 'trackingNo'), // Kargo Takip No
-      g(d, 'shipping.handedAt'),                    // Kargoya Veriliş Tarihi
-      g(d, 'shipping.deliveryStatus'),              // Teslimat Durumu
-      g(d, 'shipping.deliveryDate'),                // Teslimat Tarihi
-      g(d, 'shipping.referenceId') || g(d, 'dhlRef') || g(d, 'referenceId'), // DHL Referans No
-
-      // D) Cost / notes
-      g(d, 'shipping.cost') || g(d, 'shippingCost'), // Kargo Ücreti
-      g(d, 'notes')                                  // Notlar
-    ]));
-
-    res.setHeader('content-type', 'application/json');
-    res.status(200).end(JSON.stringify({
-      ok: true,
-      headers: HEADERS,
-      rows
-    }));
-  } catch (err) {
-    console.error('sync error:', err);
-    res.status(200).json({ ok: false, error: String(err && err.message || err) });
-  }
-};
+}
