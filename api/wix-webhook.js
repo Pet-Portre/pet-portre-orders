@@ -1,105 +1,109 @@
-import { getDb } from "../lib/db";
+// api/wix-webhook.js
+import { getDb } from "../lib/db.js";
 
-// Upsert normalized order docs into pet-portre.orders
 export default async function handler(req, res) {
-  if (req.method !== "POST") return res.status(405).json({ ok: false, error: "Method not allowed" });
-
-  // Token guard via query param (?token=…)
-  const token = (req.query?.token || "").toString();
-  const expected = process.env.WIX_WEBHOOK_TOKEN || "";
-  if (!expected || token !== expected) {
-    return res.status(401).json({ ok: false, error: "unauthorized" });
-  }
-
   try {
-    const body = req.body || {};
-    const db = await getDb();
+    if (req.method !== "POST") {
+      return res.status(405).json({ ok: false, error: "method not allowed" });
+    }
 
-    // Store raw payload for debugging
-    await db.collection("raw_events").insertOne({
-      source: "wix",
-      receivedAt: new Date(),
-      body
-    });
+    const expected = process.env.WIX_WEBHOOK_TOKEN;
+    const given = new URL(req.url, "http://local").searchParams.get("token");
+    if (expected && given !== expected) {
+      return res.status(401).json({ ok: false, error: "unauthorized" });
+    }
 
-    // ---- Minimal, safe normalization from Wix ----
-    // Adjust selectors if your payload differs.
-    const orderNumber = (body?.order?.number || body?.number || body?.orderNumber || "").toString();
-    if (!orderNumber) return res.status(200).json({ ok: true, note: "no order number" });
+    // Wix Automations "Send HTTP request" → Body = Entire payload
+    const body = await readJson(req);
 
-    const createdAtStr = body?.order?.dateCreated || body?.dateCreated || body?.createdAt;
-    const createdAt = createdAtStr ? new Date(createdAtStr) : new Date();
+    // Very defensive extraction (Wix payloads vary by template/apps)
+    const orderNumber = String(
+      body?.orderNumber ?? body?.number ?? body?.id ?? body?.orderId ?? ""
+    );
+
+    const createdAt = body?.createdDate || body?.createdAt || new Date();
 
     const customer = {
-      name: body?.buyer?.fullName || body?.buyer?.name || body?.billingInfo?.fullName || "",
-      email: body?.buyer?.email || body?.email || "",
-      phone: body?.buyer?.phone || body?.billingInfo?.phone || "",
+      name: body?.buyerName || body?.customer?.name || "",
+      email: body?.buyerEmail || body?.customer?.email || "",
+      phone: body?.buyerPhone || body?.customer?.phone || "",
       address: {
-        line1: body?.shippingInfo?.address?.addressLine || body?.shippingInfo?.address?.street || "",
-        line2: body?.shippingInfo?.address?.apartment || "",
-        district: body?.shippingInfo?.address?.neighborhood || "",
-        city: body?.shippingInfo?.address?.city || "",
-        postcode: body?.shippingInfo?.address?.postalCode || ""
+        line1: body?.shippingAddress?.addressLine || body?.shippingInfo?.shippingAddress?.addressLine || ""
       }
     };
 
-    // Items
-    const itemsArr = Array.isArray(body?.lineItems) ? body.lineItems : (Array.isArray(body?.items) ? body.items : []);
-    const items = itemsArr.map((it) => ({
-      sku: it?.sku || "",
-      name: it?.name || it?.productName || "",
-      qty: Number(it?.quantity || 1),
-      unitPrice: Number(it?.price?.amount || it?.price || 0),
-      variants: {
-        tshirtSize: it?.options?.tshirtSize || it?.variant?.size || "",
-        gender: it?.options?.gender || "",
-        color: it?.options?.color || it?.variant?.color || "",
-        phoneModel: it?.options?.phoneModel || "",
-        portraitSize: it?.options?.portraitSize || ""
-      }
-    }));
-
-    const totals = {
-      grandTotal: Number(body?.totals?.grandTotal?.amount || body?.grandTotal || body?.payment?.amount || 0),
-      discount: Number(body?.totals?.discount?.amount || 0),
-      shipping: Number(body?.totals?.shipping?.amount || 0),
-      currency: (body?.currency || body?.totals?.currency || "TRY").toString()
-    };
+    const items = Array.isArray(body?.lineItems)
+      ? body.lineItems.map(li => ({
+          sku: li.sku || "",
+          name: li.name || li.productName || "",
+          qty: Number(li.quantity ?? 1),
+          unitPrice: Number(li.priceData?.price?.amount ?? li.price ?? 0),
+          variants: {
+            tshirtSize: li.options?.tshirtSize || "",
+            gender:     li.options?.gender || "",
+            color:      li.options?.color || "",
+            phoneModel: li.options?.phoneModel || "",
+            portraitSize: li.options?.portraitSize || ""
+          }
+        }))
+      : [];
 
     const payment = {
-      method: (body?.payment?.gatewayName || body?.payment?.method || "paytr").toString()
+      method: body?.paymentMethod || body?.paymentInfo?.paymentMethod || "paytr"
     };
 
-    const delivery = {
-      courier: "MNG Kargo",
-      trackingNumber: "",
-      status: ""
+    const totals = {
+      grandTotal: Number(body?.totals?.total?.amount ?? body?.totalPrice ?? 0),
+      shipping:   Number(body?.totals?.shipping?.amount ?? body?.shippingPrice ?? 0),
+      discount:   Number(body?.totals?.discount?.amount ?? body?.discount ?? 0),
+      currency:   body?.currency || body?.totals?.total?.currency || "TRY"
     };
 
     const doc = {
       channel: "wix",
       orderNumber,
-      _createdByWebhookAt: new Date(),
-      createdAt,
-      updatedAt: new Date(),
+      createdAt: new Date(createdAt),
       customer,
       items,
-      totals,
       payment,
-      delivery,
-      supplier: {},   // optional
-      notes: (body?.note || "").toString()
+      totals,
+      delivery: {
+        courier: "",              // set when you create/print labels
+        trackingNumber: "",       // set later
+        status: "",               // set by tracking job
+        cargoDispatchDate: null,  // set when handed to courier
+        dateDelivered: null,      // set by tracking job
+        referenceIdPlaceholder: ""// we may set "<KANAL><NO>" later from Sheets
+      },
+      supplier: {
+        name: "", orderId: "", cargoCompany: "", cargoTrackingNo: "",
+        givenAt: null, receivedAt: null
+      },
+      notes: body?.note || "",
+      _raw: body,                // keep the raw event for troubleshooting
+      updatedAt: new Date()
     };
 
-    await db.collection("orders").updateOne(
+    const db = await getDb();
+    const col = db.collection("orders");
+
+    // upsert by orderNumber + channel to avoid duplicates
+    await col.updateOne(
       { channel: "wix", orderNumber },
-      { $set: doc },
+      { $set: doc, $setOnInsert: { _createdByWebhookAt: new Date() } },
       { upsert: true }
     );
 
     return res.status(200).json({ ok: true });
   } catch (e) {
-    console.error("wix-webhook error:", e);
-    return res.status(500).json({ ok: false, error: e.message });
+    console.error(e);
+    return res.status(500).json({ ok: false, error: e.message || "internal error" });
   }
+}
+
+async function readJson(req) {
+  const chunks = [];
+  for await (const c of req) chunks.push(c);
+  const text = Buffer.concat(chunks).toString("utf8") || "{}";
+  return JSON.parse(text);
 }
