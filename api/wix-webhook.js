@@ -1,161 +1,223 @@
 // api/wix-webhook.js
-const getDb = require('../lib/db');
+const { MongoClient } = require("mongodb");
 
-// small helper
-function asNumber(x, d = 0) {
-  const n = Number(x);
-  return Number.isFinite(n) ? n : d;
+const uri = process.env.MONGODB_URI;
+const dbName = process.env.MONGODB_DB || "pet-portre";
+const WEBHOOK_TOKEN = process.env.WIX_WEBHOOK_TOKEN || "";
+
+let _clientPromise;
+function getClient() {
+  if (!_clientPromise) _clientPromise = new MongoClient(uri).connect();
+  return _clientPromise;
 }
-function safe(obj, path, d = undefined) {
-  return path.split('.').reduce((o, k) => (o && o[k] != null ? o[k] : undefined), obj) ?? d;
+
+// tiny helpers
+const val = (o, p, d = undefined) =>
+  p.split(".").reduce((a, k) => (a && a[k] != null ? a[k] : undefined), o) ?? d;
+
+function joinAddress(addr) {
+  if (!addr) return "";
+  const parts = [
+    addr.addressLine || addr.addressLine1 || addr.line1,
+    addr.addressLine2 || addr.line2,
+    addr.city || addr.locality,
+    addr.region || addr.state,
+    addr.postalCode || addr.zip,
+    addr.country,
+  ]
+    .filter(Boolean)
+    .join(", ");
+  return parts;
+}
+
+function mapItem(it) {
+  const variants = {};
+  const options = it.options || it.choices || it.attributes || [];
+  const readOpt = (label) => {
+    const f =
+      options.find(
+        (o) =>
+          (o.name || o.title || "").toLowerCase() === label.toLowerCase()
+      ) ||
+      options.find(
+        (o) =>
+          (o.option || o.label || "").toLowerCase() === label.toLowerCase()
+      );
+    return f ? f.value || f.selection || f.choice || "" : "";
+  };
+
+  variants.tshirtSize = readOpt("Beden") || readOpt("Size");
+  variants.gender = readOpt("Cinsiyet") || readOpt("Gender");
+  variants.color = readOpt("Renk") || readOpt("Color");
+  variants.phoneModel = readOpt("Telefon Modeli") || readOpt("Phone Model");
+  variants.portraitSize = readOpt("Tablo Boyutu") || readOpt("Portrait Size");
+
+  const unitPrice =
+    val(it, "price.amount") ??
+    val(it, "priceData.amount") ??
+    val(it, "price") ??
+    val(it, "priceData.unitAmount") ??
+    0;
+
+  return {
+    sku: it.sku || it.productSku || it.catalogSku || it.productId || "",
+    name: it.name || it.title || "",
+    qty: Number(it.quantity || it.qty || 1),
+    unitPrice: Number(unitPrice) || 0,
+    variants,
+  };
+}
+
+function transformToOrder(doc) {
+  const shipping = val(doc, "shippingAddress") || val(doc, "delivery.address");
+  const billing = val(doc, "billingInfo") || val(doc, "billingAddress");
+  const contact = val(doc, "contact") || val(doc, "buyer") || {};
+
+  const first =
+    val(contact, "firstName") ||
+    val(billing, "firstName") ||
+    val(shipping, "firstName") ||
+    "";
+  const last =
+    val(contact, "lastName") ||
+    val(billing, "lastName") ||
+    val(shipping, "lastName") ||
+    "";
+  const phone =
+    val(contact, "phone") ||
+    val(billing, "phone") ||
+    val(shipping, "phone") ||
+    val(doc, "phone") ||
+    "";
+  const email =
+    val(contact, "email") ||
+    val(billing, "email") ||
+    val(doc, "buyerEmail") ||
+    "";
+
+  const items =
+    val(doc, "lineItems") ||
+    val(doc, "items") ||
+    val(doc, "cart.lineItems") ||
+    [];
+
+  const totals = {
+    grandTotal:
+      Number(val(doc, "totals.total")) ||
+      Number(val(doc, "totals.grandTotal")) ||
+      Number(val(doc, "totalAmount")) ||
+      Number(val(doc, "priceSummary.total")) ||
+      0,
+    shipping:
+      Number(val(doc, "totals.shipping")) ||
+      Number(val(doc, "shippingPrice")) ||
+      0,
+    discount:
+      Number(val(doc, "totals.discount")) ||
+      Number(val(doc, "discountAmount")) ||
+      0,
+    currency:
+      val(doc, "currency") ||
+      val(doc, "totals.currency") ||
+      val(doc, "priceSummary.currency") ||
+      "TRY",
+  };
+
+  const orderNumber =
+    String(val(doc, "orderNumber")) ||
+    String(val(doc, "number")) ||
+    String(val(doc, "id")) ||
+    String(val(doc, "_id") || "");
+
+  const createdAt =
+    val(doc, "createdAt") ||
+    val(doc, "dateCreated") ||
+    val(doc, "createdDate") ||
+    new Date();
+
+  const paymentMethod =
+    val(doc, "paymentMethod") ||
+    val(doc, "payment.provider") ||
+    val(doc, "transactions[0].gateway") ||
+    "";
+
+  return {
+    channel: "wix",
+    orderNumber,
+    createdAt: new Date(createdAt),
+    customer: {
+      name: `${first} ${last}`.trim(),
+      email,
+      phone,
+      address: { line1: joinAddress(shipping) },
+    },
+    delivery: {
+      courier: "", // set later by create-order flow
+      trackingNumber: "",
+      status: "NEW",
+    },
+    items: (items || []).map(mapItem),
+    payment: { method: paymentMethod },
+    supplier: {},
+    totals,
+    notes:
+      val(doc, "note") ||
+      val(doc, "buyerNote") ||
+      val(doc, "remarks") ||
+      "",
+    updatedAt: new Date(),
+  };
 }
 
 module.exports = async (req, res) => {
   try {
-    // 1) Method & token
-    if (req.method !== 'POST') {
-      return res.status(200).json({ ok: true, info: 'POST me your Wix payload' });
-    }
-    const expected = process.env.WIX_WEBHOOK_TOKEN || '';
-    const token = (req.query.token || req.headers['x-webhook-token'] || '').toString();
-    if (expected && token !== expected) {
-      return res.status(401).json({ ok: false, error: 'unauthorized' });
-    }
+    if (req.method !== "POST")
+      return res.status(405).json({ ok: false, error: "method not allowed" });
 
-    // 2) Parse body (Wix "Send HTTP request" → Entire payload)
-    let body = req.body;
-    if (typeof body === 'string') {
-      try { body = JSON.parse(body); } catch {}
-    }
-    if (!body || typeof body !== 'object') {
-      return res.status(400).json({ ok: false, error: 'invalid body' });
+    if ((req.query.token || "") !== WEBHOOK_TOKEN)
+      return res.status(401).json({ ok: false, error: "unauthorized" });
+
+    // body may arrive parsed or as string depending on Wix; handle both
+    let payload = req.body;
+    if (!payload || typeof payload === "string") {
+      try {
+        payload = JSON.parse(payload || "{}");
+      } catch {
+        payload = {};
+      }
     }
 
-    // 3) Map as best we can (tolerant of different Wix shapes)
-    const orderNumber =
-      String(
-        body.number ?? body.orderNumber ?? safe(body, 'order.number') ?? safe(body, 'id') ?? ''
-      ).trim();
+    const client = await getClient();
+    const db = client.db(dbName);
 
-    if (!orderNumber) {
-      return res.status(400).json({ ok: false, error: 'missing order number' });
+    // store raw for auditing
+    await db.collection("raw_events").insertOne({
+      receivedAt: new Date(),
+      source: "wix-automation",
+      payload,
+    });
+
+    const orderDoc = transformToOrder(payload);
+    if (!orderDoc.orderNumber) {
+      return res.status(200).json({
+        ok: true,
+        storedRaw: true,
+        note: "No orderNumber in payload; skipped upsert to orders.",
+      });
     }
 
-    const createdAtRaw =
-      body.createdAt ||
-      body.dateCreated ||
-      safe(body, 'order.createdDate') ||
-      new Date().toISOString();
-
-    const buyer = body.buyer || body.customer || body.billingInfo || {};
-    const shipping = body.shippingAddress || body.shippingInfo || {};
-    const lineItems = body.lineItems || body.items || safe(body, 'order.lineItems') || [];
-
-    const customer = {
-      name:
-        buyer.fullName ||
-        [buyer.firstName, buyer.lastName].filter(Boolean).join(' ') ||
-        shipping.fullName ||
-        '',
-      email: buyer.email || body.email || '',
-      phone: shipping.phone || buyer.phone || '',
-      address: {
-        line1:
-          shipping.addressLine ||
-          [shipping.street, shipping.addressLine1, shipping.address1]
-            .filter(Boolean)
-            .join(' ') ||
-          '',
-        city: shipping.city || shipping.locality || '',
-        district: shipping.district || '',
-        postcode: shipping.postalCode || shipping.zip || '',
-      },
-    };
-
-    const items = lineItems.map((it) => ({
-      sku: it.sku || it.catalogId || it.productId || '',
-      name: it.name || it.productName || '',
-      qty: asNumber(it.quantity ?? it.qty ?? 1, 1),
-      unitPrice: asNumber(
-        safe(it, 'priceData.price') ?? it.price ?? it.unitPrice ?? it.totalPrice, 0
-      ),
-      variants: {
-        tshirtSize: safe(it, 'options.size') || safe(it, 'variant.size') || '',
-        gender: safe(it, 'options.gender') || '',
-        color: safe(it, 'options.color') || '',
-        phoneModel: safe(it, 'options.phoneModel') || '',
-        portraitSize: safe(it, 'options.portraitSize') || '',
-      },
-    }));
-
-    const totals = {
-      grandTotal:
-        asNumber(
-          safe(body, 'totals.total') ??
-            safe(body, 'priceSummary.grandTotal') ??
-            body.totalPrice ??
-            body.amount,
-          0
-        ),
-      discount: asNumber(safe(body, 'priceSummary.discount') ?? body.discount, 0),
-      shipping: asNumber(safe(body, 'priceSummary.shipping') ?? safe(body, 'shipping.price'), 0),
-      currency: body.currency || safe(body, 'totals.currency') || 'TRY',
-    };
-
-    const payment = {
-      method: body.paymentMethod || body.paymentProvider || body.gateway || '',
-    };
-
-    const delivery = {
-      courier: safe(body, 'shippingInfo.carrier') || safe(body, 'delivery.courier') || '',
-      trackingNumber:
-        safe(body, 'shippingInfo.trackingNumber') || safe(body, 'delivery.trackingNumber') || '',
-      cargoDispatchDate: safe(body, 'delivery.cargoDispatchDate') || null,
-      dateDelivered: safe(body, 'delivery.dateDelivered') || null,
-      status: safe(body, 'delivery.status') || '',
-      referenceId: safe(body, 'delivery.referenceId') || '',
-      referenceIdPlaceholder: safe(body, 'delivery.referenceIdPlaceholder') || '',
-    };
-
-    const doc = {
-      channel: 'wix',
-      orderNumber: String(orderNumber),
-      createdAt: new Date(createdAtRaw),
-      updatedAt: new Date(),
-      customer,
-      items,
-      payment,
-      totals,
-      delivery,
-      supplier: safe(body, 'supplier') || {},
-      notes: body.note || body.buyerNote || '',
-    };
-
-    // 4) Upsert
-    const db = await getDb();
-    await db.collection('orders').updateOne(
-      { channel: 'wix', orderNumber: doc.orderNumber },
+    // upsert into orders
+    await db.collection("orders").updateOne(
+      { channel: "wix", orderNumber: orderDoc.orderNumber },
       {
-        $setOnInsert: { createdAt: doc.createdAt },
-        $set: {
-          updatedAt: doc.updatedAt,
-          customer: doc.customer,
-          items: doc.items,
-          payment: doc.payment,
-          totals: doc.totals,
-          delivery: doc.delivery,
-          supplier: doc.supplier,
-          notes: doc.notes,
-        },
-        $push: { raw_events: { at: new Date(), body } },
-        $setOnInsert: { channel: 'wix' },
+        $set: orderDoc,
+        $setOnInsert: { createdAt: orderDoc.createdAt || new Date() },
       },
       { upsert: true }
     );
 
-    res.status(200).json({ ok: true, orderNumber: doc.orderNumber });
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ ok: false, error: err.message || String(err) });
+    res.status(200).json({ ok: true, orderNumber: orderDoc.orderNumber });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: e.message });
   }
 };
