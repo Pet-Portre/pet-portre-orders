@@ -1,4 +1,4 @@
-// api/wix-webhook.js  (CommonJS, no import/export)
+// api/wix-webhook.js  (CommonJS)
 const { getClient } = require('../lib/db');
 
 const TOKEN = process.env.WIX_WEBHOOK_TOKEN;
@@ -10,23 +10,17 @@ module.exports = async (req, res) => {
       return res.status(405).send('POST only — wix-webhook');
     }
 
-    // simple token check
     const token = (req.query.token || '').trim();
     if (!TOKEN || token !== TOKEN) {
       return res.status(401).json({ ok: false, error: 'unauthorized' });
     }
 
-    // parse body safely (works for raw JSON or already-parsed body)
     let body = req.body;
     if (typeof body === 'string') {
-      try { body = JSON.parse(body); }
-      catch { return res.status(400).json({ ok: false, error: 'Invalid JSON' }); }
+      try { body = JSON.parse(body); } catch { return res.status(400).json({ ok:false, error:'Invalid JSON' }); }
     }
-    if (!body || typeof body !== 'object') {
-      return res.status(400).json({ ok: false, error: 'Empty body' });
-    }
+    if (!body || typeof body !== 'object') return res.status(400).json({ ok:false, error:'Empty body' });
 
-    // Accept both our test shape and Wix-like shape
     const order = body.order || body;
 
     const doc = {
@@ -56,18 +50,15 @@ module.exports = async (req, res) => {
       notes: order.notes || order.note || ''
     };
 
-    if (!doc.orderNumber) {
-      return res.status(400).json({ ok: false, error: 'order.number missing' });
-    }
+    if (!doc.orderNumber) return res.status(400).json({ ok:false, error:'order.number missing' });
 
-    // DB write
     const client = await getClient();
     const dbName = process.env.MONGODB_DB || 'pet-portre';
     const r = await client.db(dbName).collection('orders').insertOne(doc);
 
-    return res.status(200).json({ ok: true, orderNumber: doc.orderNumber, db: dbName, _id: r.insertedId });
+    return res.status(200).json({ ok:true, orderNumber: doc.orderNumber, db: dbName, _id: r.insertedId });
   } catch (err) {
     console.error('wix-webhook crash:', err);
-    return res.status(500).json({ ok: false, error: err.message || String(err) });
+    return res.status(500).json({ ok:false, error: err.message || String(err) });
   }
 };
