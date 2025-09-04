@@ -1,33 +1,36 @@
-// api/wix-webhook.js
-import { getClient } from '../lib/db.js';
+// api/wix-webhook.js  (CommonJS, no import/export)
+const { getClient } = require('../lib/db');
 
 const TOKEN = process.env.WIX_WEBHOOK_TOKEN;
 
-export default async function handler(req, res) {
+module.exports = async (req, res) => {
   try {
     if (req.method !== 'POST') {
       res.setHeader('Allow', 'POST');
       return res.status(405).send('POST only — wix-webhook');
     }
 
-    // token guard
+    // simple token check
     const token = (req.query.token || '').trim();
     if (!TOKEN || token !== TOKEN) {
       return res.status(401).json({ ok: false, error: 'unauthorized' });
     }
 
-    // parse payload (Wix or our test JSON)
-    let body;
-    try {
-      body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
-    } catch {
-      return res.status(400).json({ ok: false, error: 'Invalid JSON' });
+    // parse body safely (works for raw JSON or already-parsed body)
+    let body = req.body;
+    if (typeof body === 'string') {
+      try { body = JSON.parse(body); }
+      catch { return res.status(400).json({ ok: false, error: 'Invalid JSON' }); }
+    }
+    if (!body || typeof body !== 'object') {
+      return res.status(400).json({ ok: false, error: 'Empty body' });
     }
 
-    // Build a minimal doc (tolerates both our test shape and real Wix)
+    // Accept both our test shape and Wix-like shape
     const order = body.order || body;
+
     const doc = {
-      channel: (order.channel || process.env.APP_CHANNEL_DEFAULT || 'wix').toLowerCase(),
+      channel: String(order.channel || process.env.APP_CHANNEL_DEFAULT || 'wix').toLowerCase(),
       orderNumber: String(order.number || order.orderNumber || '').trim(),
       _createdByWebhookAt: new Date(),
       createdAt: order.createdAt ? new Date(order.createdAt) : new Date(),
@@ -36,12 +39,14 @@ export default async function handler(req, res) {
         email: order.customer?.email || order.buyerInfo?.email || '',
         phone: order.customer?.phone || order.buyerInfo?.phone || ''
       },
-      items: Array.isArray(order.items || order.lineItems) ? (order.items || order.lineItems).map(it => ({
-        sku: it.sku || it.code || '',
-        name: it.name || it.title || '',
-        qty: Number(it.qty || it.quantity || 0),
-        unitPrice: Number(it.unitPrice || it.price?.amount || it.price || 0)
-      })) : [],
+      items: Array.isArray(order.items || order.lineItems)
+        ? (order.items || order.lineItems).map(it => ({
+            sku: it.sku || it.code || '',
+            name: it.name || it.title || '',
+            qty: Number(it.qty || it.quantity || 0),
+            unitPrice: Number(it.unitPrice || it.price?.amount || it.price || 0)
+          }))
+        : [],
       totals: {
         total: Number(order.totals?.total ?? order.total ?? 0),
         shipping: Number(order.totals?.shipping ?? order.shipping ?? 0),
@@ -55,25 +60,14 @@ export default async function handler(req, res) {
       return res.status(400).json({ ok: false, error: 'order.number missing' });
     }
 
-    // DB write with verbose error surfacing
+    // DB write
     const client = await getClient();
     const dbName = process.env.MONGODB_DB || 'pet-portre';
-    const db = client.db(dbName);
+    const r = await client.db(dbName).collection('orders').insertOne(doc);
 
-    try {
-      const r = await db.collection('orders').insertOne(doc);
-      return res.status(200).json({ ok: true, orderNumber: doc.orderNumber, db: dbName, _id: r.insertedId });
-    } catch (e) {
-      console.error('Mongo insert failed:', e);
-      return res.status(500).json({
-        ok: false,
-        error: e.message,
-        code: e.codeName || e.code || e.name,
-        db: dbName
-      });
-    }
+    return res.status(200).json({ ok: true, orderNumber: doc.orderNumber, db: dbName, _id: r.insertedId });
   } catch (err) {
-    console.error('Webhook handler crash:', err);
-    return res.status(500).json({ ok: false, error: 'handler_crashed', detail: err.message });
+    console.error('wix-webhook crash:', err);
+    return res.status(500).json({ ok: false, error: err.message || String(err) });
   }
-}
+};
