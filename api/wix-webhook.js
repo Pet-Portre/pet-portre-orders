@@ -1,117 +1,79 @@
-// Minimal Wix → MongoDB webhook (POST only)
-const { getDb } = require('../lib/db');
+// api/wix-webhook.js
+import { getClient } from '../lib/db.js';
 
-module.exports = async (req, res) => {
-  if (req.method !== 'POST') {
-    res.setHeader('Allow', 'POST');
-    return res.status(405).send('POST only — wix-webhook');
-  }
+const TOKEN = process.env.WIX_WEBHOOK_TOKEN;
 
+export default async function handler(req, res) {
   try {
-    // simple shared secret (either ?token= or x-api-key)
-    const token = String(req.query.token || req.headers['x-api-key'] || '');
-    const required = process.env.WIX_WEBHOOK_TOKEN || '';
-    if (required && token !== required) {
+    if (req.method !== 'POST') {
+      res.setHeader('Allow', 'POST');
+      return res.status(405).send('POST only — wix-webhook');
+    }
+
+    // token guard
+    const token = (req.query.token || '').trim();
+    if (!TOKEN || token !== TOKEN) {
       return res.status(401).json({ ok: false, error: 'unauthorized' });
     }
 
-    // handle raw JSON string bodies safely
-    let body = req.body;
-    if (typeof body === 'string') {
-      try { body = JSON.parse(body); } catch { /* ignore */ }
-    }
-    body = body || {};
-
-    // health ping support
-    if (body.ping === true) {
-      return res.status(200).json({ ok: true, receivedAt: new Date().toISOString() });
+    // parse payload (Wix or our test JSON)
+    let body;
+    try {
+      body = typeof req.body === 'string' ? JSON.parse(req.body) : req.body;
+    } catch {
+      return res.status(400).json({ ok: false, error: 'Invalid JSON' });
     }
 
-    const now = new Date();
-
-    // normalize common Wix shapes to our document
-    const orderNumber =
-      (body.order && (body.order.number || body.order.id)) ||
-      body.number || body.id || '';
-
-    const createdAtStr =
-      (body.order && body.order.createdDate) || body.createdDate || body.dateCreated;
-
-    const buyer = body.buyerInfo || body.customer || {};
-    const billing = (body.billingInfo && body.billingInfo.address) || {};
-
-    // line items: accept body.items[] or body.lineItems[]
-    let items = [];
-    if (Array.isArray(body.items)) {
-      items = body.items.map(i => ({
-        sku: String(i.sku || ''),
-        name: String(i.name || ''),
-        qty: Number(i.qty || i.quantity || 1),
-        unitPrice: Number(
-          (i.unitPrice != null ? i.unitPrice :
-           i.price && i.price.amount != null ? i.price.amount :
-           i.price) || 0
-        ),
-        variants: i.variants || {}
-      }));
-    } else if (Array.isArray(body.lineItems)) {
-      items = body.lineItems.map(i => ({
-        sku: String(i.sku || ''),
-        name: String(i.name || ''),
-        qty: Number(i.quantity || 1),
-        unitPrice: Number(
-          (i.price && i.price.amount != null ? i.price.amount : i.price) || 0
-        ),
-        variants: {}
-      }));
-    }
-
-    const totals = body.totals || {};
+    // Build a minimal doc (tolerates both our test shape and real Wix)
+    const order = body.order || body;
     const doc = {
-      channel: 'wix',
-      orderNumber: String(orderNumber || ''),
-      _createdByWebhookAt: now,
-      createdAt: createdAtStr ? new Date(createdAtStr) : now,
-
+      channel: (order.channel || process.env.APP_CHANNEL_DEFAULT || 'wix').toLowerCase(),
+      orderNumber: String(order.number || order.orderNumber || '').trim(),
+      _createdByWebhookAt: new Date(),
+      createdAt: order.createdAt ? new Date(order.createdAt) : new Date(),
       customer: {
-        name:
-          buyer.name ||
-          [buyer.firstName, buyer.lastName].filter(Boolean).join(' ').trim() ||
-          '',
-        email: buyer.email || '',
-        phone: buyer.phone || '',
-        address: {
-          line1: body.address || billing.addressLine || billing.addressLine1 || '',
-          city: body.city || billing.city || '',
-          postcode: body.postalCode || billing.postalCode || ''
-        }
+        name: order.customer?.name || [order.buyerInfo?.firstName, order.buyerInfo?.lastName].filter(Boolean).join(' ') || '',
+        email: order.customer?.email || order.buyerInfo?.email || '',
+        phone: order.customer?.phone || order.buyerInfo?.phone || ''
       },
-
-      delivery: {},
-      supplier: {},
-      payment: { method: (body.payment && body.payment.method) || body.paymentMethod || '' },
-
-      items,
+      items: Array.isArray(order.items || order.lineItems) ? (order.items || order.lineItems).map(it => ({
+        sku: it.sku || it.code || '',
+        name: it.name || it.title || '',
+        qty: Number(it.qty || it.quantity || 0),
+        unitPrice: Number(it.unitPrice || it.price?.amount || it.price || 0)
+      })) : [],
       totals: {
-        grandTotal:
-          Number(
-            totals.total != null ? totals.total :
-            totals.grandTotal != null ? totals.grandTotal : 0
-          ),
-        shipping: Number(totals.shipping || 0),
-        discount: Number(totals.discount || 0),
-        currency: String(totals.currency || 'TRY')
+        total: Number(order.totals?.total ?? order.total ?? 0),
+        shipping: Number(order.totals?.shipping ?? order.shipping ?? 0),
+        discount: Number(order.totals?.discount ?? order.discount ?? 0),
+        currency: order.totals?.currency || order.currency || 'TRY'
       },
-
-      notes: String(body.notes || '')
+      notes: order.notes || order.note || ''
     };
 
-    const db = await getDb();
-    const result = await db.collection('orders').insertOne(doc);
+    if (!doc.orderNumber) {
+      return res.status(400).json({ ok: false, error: 'order.number missing' });
+    }
 
-    return res.status(200).json({ ok: true, orderNumber: doc.orderNumber, id: String(result.insertedId) });
-  } catch (e) {
-    console.error('webhook error:', e);
-    return res.status(500).json({ ok: false, error: e.message || 'server_error' });
+    // DB write with verbose error surfacing
+    const client = await getClient();
+    const dbName = process.env.MONGODB_DB || 'pet-portre';
+    const db = client.db(dbName);
+
+    try {
+      const r = await db.collection('orders').insertOne(doc);
+      return res.status(200).json({ ok: true, orderNumber: doc.orderNumber, db: dbName, _id: r.insertedId });
+    } catch (e) {
+      console.error('Mongo insert failed:', e);
+      return res.status(500).json({
+        ok: false,
+        error: e.message,
+        code: e.codeName || e.code || e.name,
+        db: dbName
+      });
+    }
+  } catch (err) {
+    console.error('Webhook handler crash:', err);
+    return res.status(500).json({ ok: false, error: 'handler_crashed', detail: err.message });
   }
-};
+}
