@@ -2,8 +2,7 @@
   "name": "pet-portre-orders",
   "version": "1.0.0",
   "private": true,
-  "type": "commonjs",
-  "engines": { "node": ">=18.0.0" },
+  "engines": { "node": ">=18" },
   "dependencies": {
     "mongodb": "^5.9.0"
   }
