@@ -1,27 +1,37 @@
 // api/db-ping.js
+const { withDb } = require('../lib/db');
+
 module.exports = async (req, res) => {
-  res.setHeader('content-type', 'application/json; charset=utf-8');
+  // keep this simple and cacheless so it reflects live connectivity
+  res.setHeader('Cache-Control', 'no-store');
+
+  if (req.method !== 'GET') {
+    res.setHeader('Allow', 'GET');
+    return res.status(405).json({ ok: false, error: 'GET only — db-ping' });
+  }
+
   try {
-    const { getDb } = require('../lib/db');
-    const db = await getDb();
-    const ping = await db.command({ ping: 1 });
-    res.status(200).end(JSON.stringify({
+    const { ping, dbName } = await withDb(async (db) => {
+      const ping = await db.admin().ping();        // { ok: 1 }
+      return { ping, dbName: db.databaseName };
+    });
+
+    return res.status(200).json({
       ok: true,
-      db: process.env.MONGODB_DB,
+      db: dbName,
       ping,
-    }));
-  } catch (e) {
-    // Make the error visible in the response instead of a 500
-    console.error('db-ping error:', e);
-    res.status(200).end(JSON.stringify({
+      time: new Date().toISOString(),
+    });
+  } catch (err) {
+    return res.status(500).json({
       ok: false,
-      error: e.message,
-      stack: String(e.stack).split('\n').slice(0, 6),
+      error: err.message,
+      stack: String(err.stack || '').split('\n').slice(0, 3).join('\n'),
       env: {
         hasURI: !!process.env.MONGODB_URI,
         db: process.env.MONGODB_DB,
         node: process.version,
       },
-    }));
+    });
   }
 };
