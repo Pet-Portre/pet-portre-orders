@@ -1,166 +1,161 @@
 // api/wix-webhook.js
-import { MongoClient } from "mongodb";
+const getDb = require('../lib/db');
 
-const uri = process.env.MONGODB_URI;
-const dbName = process.env.MONGODB_DB || "pet-portre"; // <- use the DB that actually has 'orders'
-const expectedToken = process.env.WIX_WEBHOOK_TOKEN;
-
-function bad(res, code, msg) {
-  res.status(code).json({ ok: false, error: msg });
+// small helper
+function asNumber(x, d = 0) {
+  const n = Number(x);
+  return Number.isFinite(n) ? n : d;
+}
+function safe(obj, path, d = undefined) {
+  return path.split('.').reduce((o, k) => (o && o[k] != null ? o[k] : undefined), obj) ?? d;
 }
 
-async function readRawBody(req) {
-  const chunks = [];
-  for await (const c of req) chunks.push(c);
-  return Buffer.concat(chunks).toString("utf8");
-}
-
-// very tolerant mapper; fills what we can, leaves the rest
-function tryMapWixOrder(evt) {
-  // Wix Automations payloads vary; look for commonly present fields
-  const o = evt?.order || evt?.data?.order || evt?.payload?.order || null;
-  const id = o?.number || o?.id || evt?.orderId || evt?.data?.orderId || null;
-
-  if (!id && !o) return null;
-
-  const customer = o?.buyerInfo || o?.buyer || evt?.customer || {};
-  const shipping = o?.shippingInfo || o?.shipping || o?.delivery || {};
-  const address =
-    shipping?.address ||
-    shipping?.shippingAddress ||
-    evt?.shippingAddress ||
-    {};
-
-  const itemsSrc = o?.lineItems || o?.items || evt?.items || [];
-  const items = (Array.isArray(itemsSrc) ? itemsSrc : []).map(it => ({
-    sku: it.sku || it.catalogReference?.catalogItemId || "",
-    name: it.name || it.description || "",
-    qty: Number(it.quantity || it.qty || 1),
-    unitPrice: Number(
-      it.priceData?.price ||
-      it.price ||
-      it.unitPrice ||
-      0
-    )
-  }));
-
-  const totals = {
-    currency:
-      o?.priceSummary?.currency ||
-      o?.currency ||
-      evt?.currency ||
-      "TRY",
-    grandTotal:
-      Number(o?.priceSummary?.total || o?.grandTotal || evt?.total || 0),
-    shipping: Number(o?.priceSummary?.shipping || 0),
-    discount: Number(o?.priceSummary?.discount || 0)
-  };
-
-  return {
-    channel: "wix",
-    orderNumber: String(id || "").replace(/^#/, ""),
-    createdAt: new Date(o?.createdDate || evt?.createdAt || Date.now()),
-    customer: {
-      name:
-        customer?.fullName ||
-        [customer?.firstName, customer?.lastName].filter(Boolean).join(" ") ||
-        "",
-      email: customer?.email || evt?.buyerEmail || "",
-      phone: customer?.phone || evt?.buyerPhone || ""
-    },
-    delivery: {
-      courier: "", // filled later when you create DHL/MNG order
-      trackingNumber: "",
-      referenceId: "", // set later by Create Order flow
-      address: {
-        line1:
-          address?.addressLine1 ||
-          address?.line1 ||
-          [address?.street, address?.houseNumber]
-            .filter(Boolean)
-            .join(" ") ||
-          "",
-        line2: address?.addressLine2 || address?.line2 || "",
-        city: address?.city || "",
-        district: address?.subdivision || address?.district || "",
-        postcode: address?.postalCode || address?.zip || ""
-      }
-    },
-    items,
-    payment: {
-      method:
-        o?.paymentStatus || o?.gateway || evt?.paymentMethod || "" // best effort
-    },
-    totals,
-    notes: o?.buyerNote || evt?.note || ""
-  };
-}
-
-export default async function handler(req, res) {
-  // 1) Health check
-  if (req.method === "GET") {
-    return res.status(200).json({ ok: true, info: "wix-webhook alive" });
-  }
-
-  // 2) Only POST allowed for events
-  if (req.method !== "POST") {
-    return bad(res, 405, "method not allowed");
-  }
-
-  // 3) Token guard
-  const q = new URL(req.url, "http://x").searchParams;
-  const token = q.get("token");
-  if (expectedToken && token !== expectedToken) {
-    return bad(res, 401, "invalid token");
-  }
-
-  // 4) Read & parse safely
-  let raw = "";
-  let evt = null;
+module.exports = async (req, res) => {
   try {
-    raw = await readRawBody(req);
-    evt = raw ? JSON.parse(raw) : {};
-  } catch (e) {
-    // keep raw around for debugging
-    evt = { _parseError: e.message, raw };
-  }
-
-  // 5) DB
-  let client;
-  try {
-    client = new MongoClient(uri);
-    await client.connect();
-    const db = client.db(dbName);
-
-    // Always persist the raw event for auditing/debug
-    const rawDoc = {
-      source: "wix",
-      receivedAt: new Date(),
-      headers: req.headers,
-      event: evt
-    };
-    await db.collection("raw_events").insertOne(rawDoc);
-
-    // Try to map into 'orders' (best effort). If mapping fails, we still return 200.
-    try {
-      const order = tryMapWixOrder(evt);
-      if (order?.orderNumber) {
-        await db.collection("orders").updateOne(
-          { channel: "wix", orderNumber: order.orderNumber },
-          { $set: order },
-          { upsert: true }
-        );
-      }
-    } catch (mapErr) {
-      // swallow mapping errors; you still have raw_events
-      console.error("map/order upsert error:", mapErr?.message);
+    // 1) Method & token
+    if (req.method !== 'POST') {
+      return res.status(200).json({ ok: true, info: 'POST me your Wix payload' });
+    }
+    const expected = process.env.WIX_WEBHOOK_TOKEN || '';
+    const token = (req.query.token || req.headers['x-webhook-token'] || '').toString();
+    if (expected && token !== expected) {
+      return res.status(401).json({ ok: false, error: 'unauthorized' });
     }
 
-    return res.status(200).json({ ok: true });
-  } catch (e) {
-    console.error("webhook error:", e?.message);
-    return bad(res, 500, e.message || "internal error");
-  } finally {
-    try { await client?.close(); } catch (_) {}
+    // 2) Parse body (Wix "Send HTTP request" → Entire payload)
+    let body = req.body;
+    if (typeof body === 'string') {
+      try { body = JSON.parse(body); } catch {}
+    }
+    if (!body || typeof body !== 'object') {
+      return res.status(400).json({ ok: false, error: 'invalid body' });
+    }
+
+    // 3) Map as best we can (tolerant of different Wix shapes)
+    const orderNumber =
+      String(
+        body.number ?? body.orderNumber ?? safe(body, 'order.number') ?? safe(body, 'id') ?? ''
+      ).trim();
+
+    if (!orderNumber) {
+      return res.status(400).json({ ok: false, error: 'missing order number' });
+    }
+
+    const createdAtRaw =
+      body.createdAt ||
+      body.dateCreated ||
+      safe(body, 'order.createdDate') ||
+      new Date().toISOString();
+
+    const buyer = body.buyer || body.customer || body.billingInfo || {};
+    const shipping = body.shippingAddress || body.shippingInfo || {};
+    const lineItems = body.lineItems || body.items || safe(body, 'order.lineItems') || [];
+
+    const customer = {
+      name:
+        buyer.fullName ||
+        [buyer.firstName, buyer.lastName].filter(Boolean).join(' ') ||
+        shipping.fullName ||
+        '',
+      email: buyer.email || body.email || '',
+      phone: shipping.phone || buyer.phone || '',
+      address: {
+        line1:
+          shipping.addressLine ||
+          [shipping.street, shipping.addressLine1, shipping.address1]
+            .filter(Boolean)
+            .join(' ') ||
+          '',
+        city: shipping.city || shipping.locality || '',
+        district: shipping.district || '',
+        postcode: shipping.postalCode || shipping.zip || '',
+      },
+    };
+
+    const items = lineItems.map((it) => ({
+      sku: it.sku || it.catalogId || it.productId || '',
+      name: it.name || it.productName || '',
+      qty: asNumber(it.quantity ?? it.qty ?? 1, 1),
+      unitPrice: asNumber(
+        safe(it, 'priceData.price') ?? it.price ?? it.unitPrice ?? it.totalPrice, 0
+      ),
+      variants: {
+        tshirtSize: safe(it, 'options.size') || safe(it, 'variant.size') || '',
+        gender: safe(it, 'options.gender') || '',
+        color: safe(it, 'options.color') || '',
+        phoneModel: safe(it, 'options.phoneModel') || '',
+        portraitSize: safe(it, 'options.portraitSize') || '',
+      },
+    }));
+
+    const totals = {
+      grandTotal:
+        asNumber(
+          safe(body, 'totals.total') ??
+            safe(body, 'priceSummary.grandTotal') ??
+            body.totalPrice ??
+            body.amount,
+          0
+        ),
+      discount: asNumber(safe(body, 'priceSummary.discount') ?? body.discount, 0),
+      shipping: asNumber(safe(body, 'priceSummary.shipping') ?? safe(body, 'shipping.price'), 0),
+      currency: body.currency || safe(body, 'totals.currency') || 'TRY',
+    };
+
+    const payment = {
+      method: body.paymentMethod || body.paymentProvider || body.gateway || '',
+    };
+
+    const delivery = {
+      courier: safe(body, 'shippingInfo.carrier') || safe(body, 'delivery.courier') || '',
+      trackingNumber:
+        safe(body, 'shippingInfo.trackingNumber') || safe(body, 'delivery.trackingNumber') || '',
+      cargoDispatchDate: safe(body, 'delivery.cargoDispatchDate') || null,
+      dateDelivered: safe(body, 'delivery.dateDelivered') || null,
+      status: safe(body, 'delivery.status') || '',
+      referenceId: safe(body, 'delivery.referenceId') || '',
+      referenceIdPlaceholder: safe(body, 'delivery.referenceIdPlaceholder') || '',
+    };
+
+    const doc = {
+      channel: 'wix',
+      orderNumber: String(orderNumber),
+      createdAt: new Date(createdAtRaw),
+      updatedAt: new Date(),
+      customer,
+      items,
+      payment,
+      totals,
+      delivery,
+      supplier: safe(body, 'supplier') || {},
+      notes: body.note || body.buyerNote || '',
+    };
+
+    // 4) Upsert
+    const db = await getDb();
+    await db.collection('orders').updateOne(
+      { channel: 'wix', orderNumber: doc.orderNumber },
+      {
+        $setOnInsert: { createdAt: doc.createdAt },
+        $set: {
+          updatedAt: doc.updatedAt,
+          customer: doc.customer,
+          items: doc.items,
+          payment: doc.payment,
+          totals: doc.totals,
+          delivery: doc.delivery,
+          supplier: doc.supplier,
+          notes: doc.notes,
+        },
+        $push: { raw_events: { at: new Date(), body } },
+        $setOnInsert: { channel: 'wix' },
+      },
+      { upsert: true }
+    );
+
+    res.status(200).json({ ok: true, orderNumber: doc.orderNumber });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ ok: false, error: err.message || String(err) });
   }
-}
+};
