@@ -1,147 +1,72 @@
 // api/wix-webhook.js
-// Saves minimal order doc into Mongo (DB name from MONGODB_DB, collection: 'orders')
-const { getDb } = require('../lib/db'); // <= our lightweight native driver helper
-
-async function readRawBody(req) {
-  if (req.body) return req.body; // Vercel often gives string/object already
-  return await new Promise((resolve, reject) => {
-    let data = '';
-    req.on('data', c => (data += c));
-    req.on('end', () => resolve(data));
-    req.on('error', reject);
-  });
-}
-
-function coerceJson(x) {
-  if (!x) return {};
-  if (typeof x === 'object') return x;
-  try { return JSON.parse(x); } catch { return {}; }
-}
-
-function pickOrder(payload) {
-  // Accept {order:{...}} or common nested Wix shapes; fall back to payload
-  return (
-    payload.order ||
-    payload?.data?.order ||
-    payload?.payload?.order ||
-    payload?.entity ||
-    payload
-  );
-}
-
-function buildDoc(order) {
-  const buyerName =
-    order?.customer?.name ??
-    (order?.buyerInfo
-      ? `${order.buyerInfo.firstName || ''} ${order.buyerInfo.lastName || ''}`.trim()
-      : '');
-
-  const items = Array.isArray(order?.items)
-    ? order.items.map(i => ({
-        sku: i.sku || i.code || i.productId || '',
-        name: i.name || i.title || '',
-        qty: Number(i.qty ?? i.quantity ?? 1) || 1,
-        unitPrice:
-          Number(i.unitPrice ?? i.price?.amount ?? i.price ?? i.itemPrice?.amount ?? 0) || 0,
-      }))
-    : [];
-
-  const total =
-    Number(order?.totals?.total ?? order?.totalPrice?.amount ?? order?.total ?? 0) || 0;
-
-  const currency =
-    (order?.totals?.currency || order?.currency || 'TRY').toString().toUpperCase();
-
-  return {
-    channel: order?.channel || process.env.APP_CHANNEL_DEFAULT || 'wix',
-    orderNumber: String(order?.number ?? order?.id ?? order?._id ?? ''),
-    createdAt: order?.createdAt ? new Date(order.createdAt) : new Date(),
-    customer: {
-      name: buyerName || '',
-      email: order?.customer?.email || order?.buyerInfo?.email || '',
-      phone: order?.customer?.phone || order?.buyerInfo?.phone || '',
-    },
-    delivery: {
-      address:
-        order?.address ||
-        order?.billingInfo?.address?.addressLine ||
-        order?.shippingInfo?.address?.addressLine ||
-        '',
-      city:
-        order?.city ||
-        order?.billingInfo?.address?.city ||
-        order?.shippingInfo?.address?.city ||
-        '',
-      postcode:
-        order?.postalCode ||
-        order?.billingInfo?.address?.postalCode ||
-        order?.shippingInfo?.address?.postalCode ||
-        '',
-    },
-    items,
-    totals: { total, currency },
-    notes: order?.notes || order?.note || '',
-    _createdByWebhookAt: new Date(),
-  };
-}
+const { getDb } = require('../lib/db');
 
 module.exports = async (req, res) => {
+  if (req.method !== 'POST') {
+    res.setHeader('Allow', 'POST');
+    return res.status(405).send('POST only — wix-webhook');
+  }
+
   try {
-    if (req.method !== 'POST') {
-      res.setHeader('Allow', 'POST');
-      return res.status(405).send('POST only — wix-webhook');
-    }
-
-    const token = (req.query.token || '').trim();
+    const token = req.query.token || req.headers['x-webhook-token'];
     if (!process.env.WIX_WEBHOOK_TOKEN || token !== process.env.WIX_WEBHOOK_TOKEN) {
-      return res.status(401).json({ ok: false, error: 'unauthorized' });
+      return res.status(401).json({ ok: false, error: 'Unauthorized (token mismatch)' });
     }
 
-    // Parse body robustly (string | object)
-    const raw = await readRawBody(req);
-    const payload = coerceJson(raw);
-    const order = pickOrder(payload);
+    const body = req.body && Object.keys(req.body).length ? req.body : {};
+    // Accept either { order: {...} } or the order object itself
+    const src = body.order || body;
 
-    if (!order) {
-      return res.status(400).json({ ok: false, error: 'no order in payload' });
+    // Minimal mapping so even partial payloads work
+    const orderNumber = String(src.number || src.orderNumber || '').trim();
+    if (!orderNumber) {
+      return res.status(400).json({ ok: false, error: 'Missing order.number' });
     }
 
-    const doc = buildDoc(order);
-    if (!doc.orderNumber) {
-      return res.status(400).json({ ok: false, error: 'missing orderNumber' });
-    }
+    const doc = {
+      channel: src.channel || 'wix',
+      orderNumber,
+      createdAt: src.createdAt ? new Date(src.createdAt) : new Date(),
+      customer: {
+        name: src.customer?.name || [src.buyerInfo?.firstName, src.buyerInfo?.lastName].filter(Boolean).join(' '),
+        email: src.customer?.email || src.buyerInfo?.email,
+        phone: src.customer?.phone || src.buyerInfo?.phone
+      },
+      delivery: {
+        address: src.address || src.billingInfo?.address?.addressLine || '',
+        city: src.city || src.billingInfo?.address?.city || '',
+        postcode: src.postcode || src.billingInfo?.address?.postalCode || ''
+      },
+      items: Array.isArray(src.items) ? src.items : (Array.isArray(src.lineItems) ? src.lineItems : []),
+      totals: src.totals || { total: src.total || 0, currency: (src.currency || 'TRY') },
+      notes: src.notes || src.note || '',
+      _createdByWebhookAt: new Date()
+    };
 
-    // Lazy DB connect + upsert
-    const db = await getDb(); // uses MONGODB_URI + MONGODB_DB
+    const db = await getDb();
     const col = db.collection('orders');
 
-    const result = await col.updateOne(
+    const r = await col.updateOne(
       { orderNumber: doc.orderNumber },
-      {
-        $set: {
-          channel: doc.channel,
-          createdAt: doc.createdAt,
-          customer: doc.customer,
-          delivery: doc.delivery,
-          items: doc.items,
-          totals: doc.totals,
-          notes: doc.notes,
-          _updatedAt: new Date(),
-        },
-        $setOnInsert: { _createdByWebhookAt: doc._createdByWebhookAt },
-      },
+      { $set: doc, $setOnInsert: { _firstSeenAt: new Date() } },
       { upsert: true }
     );
 
-    return res.status(200).json({
+    return res.json({
       ok: true,
       orderNumber: doc.orderNumber,
-      upserted: Boolean(result.upsertedId),
-      matched: result.matchedCount || 0,
-      modified: result.modifiedCount || 0,
+      upserted: !!r.upsertedId,
+      matched: r.matchedCount,
+      modified: r.modifiedCount
     });
   } catch (e) {
-    console.error('wix-webhook error:', e);
-    return res.status(500).json({ ok: false, error: e.message || String(e) });
+    console.error('[wix-webhook] error:', e);
+    return res.status(500).json({
+      ok: false,
+      error: e.message,
+      name: e.name,
+      code: e.code,
+      hint: 'Hit /api/db-ping to verify DB; ensure package.json has mongodb and envs are set'
+    });
   }
 };
