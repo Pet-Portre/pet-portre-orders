@@ -1,104 +1,117 @@
-// api/wix-webhook.js
-import { getDb } from "../lib/db.js";
+// Minimal Wix → MongoDB webhook (POST only)
+const { getDb } = require('../lib/db');
 
-function ok(res, extra = {}) {
-  res.status(200).json({ ok: true, ...extra });
-}
+module.exports = async (req, res) => {
+  if (req.method !== 'POST') {
+    res.setHeader('Allow', 'POST');
+    return res.status(405).send('POST only — wix-webhook');
+  }
 
-function bad(res, msg, code = 400) {
-  res.status(code).json({ ok: false, error: msg });
-}
-
-function authOk(req) {
-  const want = process.env.WIX_WEBHOOK_TOKEN;
-  if (!want) return true; // no token set => open (for now)
-  const got = new URL(req.url, "http://x").searchParams.get("token");
-  return got === want;
-}
-
-function toStr(x) { return (x == null ? "" : String(x)); }
-
-function normalizePayload(body = {}) {
-  // Accept either your CLI test shape or a Wix-ish shape
-  const o = body.order || body;
-
-  const createdAt =
-    o.createdAt || body.createdDate || body.createdAt || new Date().toISOString();
-
-  // Customer
-  const first = body?.buyerInfo?.firstName || body?.customer?.firstName || "";
-  const last  = body?.buyerInfo?.lastName  || body?.customer?.lastName  || "";
-  const name  = body?.customer?.name || [first, last].filter(Boolean).join(" ") || "";
-  const email = body?.customer?.email || body?.buyerInfo?.email || "";
-  const phone = body?.customer?.phone || body?.buyerInfo?.phone || "";
-
-  // Address (take a single line for now; we can expand later)
-  const address =
-    body?.address ||
-    body?.billingInfo?.address?.address ||
-    body?.shippingInfo?.address?.address ||
-    body?.customer?.address ||
-    "";
-
-  // Items
-  const rawItems = body.items || body.lineItems || o.lineItems || [];
-  const items = (Array.isArray(rawItems) ? rawItems : []).map((it) => ({
-    sku:  toStr(it.sku || it.code || it.variantId || it.id),
-    name: toStr(it.name || it.title || ""),
-    qty:  Number(it.qty || it.quantity || 1),
-    price:Number(it.price?.amount ?? it.price ?? 0),
-  }));
-
-  // Totals
-  const totalsSrc = body.totals || o.totals || {};
-  const totals = {
-    total:    Number(totalsSrc.total ?? totalsSrc.amount ?? 0),
-    shipping: Number(totalsSrc.shipping ?? 0),
-    discount: Number(totalsSrc.discount ?? 0),
-    currency: toStr(totalsSrc.currency || "TRY"),
-  };
-
-  const orderNumber =
-    toStr(o.number || o.orderNumber || body.orderNumber || body.id || "");
-
-  return {
-    channel: "wix",
-    orderNumber,
-    _createdByWebhookAt: new Date(),
-    createdAt: new Date(createdAt),
-    customer: { name, email, phone, address },
-    delivery: {},
-    items,
-    supplier: {},
-    totals,
-    notes: toStr(body.notes || o.notes || ""),
-  };
-}
-
-export default async function handler(req, res) {
   try {
-    if (req.method !== "POST") {
-      res.setHeader("Allow", "POST");
-      return res.status(405).send("POST only — wix-webhook");
+    // simple shared secret (either ?token= or x-api-key)
+    const token = String(req.query.token || req.headers['x-api-key'] || '');
+    const required = process.env.WIX_WEBHOOK_TOKEN || '';
+    if (required && token !== required) {
+      return res.status(401).json({ ok: false, error: 'unauthorized' });
     }
 
-    if (!authOk(req)) return bad(res, "unauthorized", 401);
+    // handle raw JSON string bodies safely
+    let body = req.body;
+    if (typeof body === 'string') {
+      try { body = JSON.parse(body); } catch { /* ignore */ }
+    }
+    body = body || {};
 
-    const text = await new Response(req.body).text().catch(() => "");
-    const body = text ? JSON.parse(text) : {};
+    // health ping support
+    if (body.ping === true) {
+      return res.status(200).json({ ok: true, receivedAt: new Date().toISOString() });
+    }
 
-    // health ping shortcut
-    if (body.ping === true) return ok(res, { receivedAt: new Date().toISOString() });
+    const now = new Date();
 
-    const doc = normalizePayload(body);
-    if (!doc.orderNumber) return bad(res, "orderNumber missing", 422);
+    // normalize common Wix shapes to our document
+    const orderNumber =
+      (body.order && (body.order.number || body.order.id)) ||
+      body.number || body.id || '';
+
+    const createdAtStr =
+      (body.order && body.order.createdDate) || body.createdDate || body.dateCreated;
+
+    const buyer = body.buyerInfo || body.customer || {};
+    const billing = (body.billingInfo && body.billingInfo.address) || {};
+
+    // line items: accept body.items[] or body.lineItems[]
+    let items = [];
+    if (Array.isArray(body.items)) {
+      items = body.items.map(i => ({
+        sku: String(i.sku || ''),
+        name: String(i.name || ''),
+        qty: Number(i.qty || i.quantity || 1),
+        unitPrice: Number(
+          (i.unitPrice != null ? i.unitPrice :
+           i.price && i.price.amount != null ? i.price.amount :
+           i.price) || 0
+        ),
+        variants: i.variants || {}
+      }));
+    } else if (Array.isArray(body.lineItems)) {
+      items = body.lineItems.map(i => ({
+        sku: String(i.sku || ''),
+        name: String(i.name || ''),
+        qty: Number(i.quantity || 1),
+        unitPrice: Number(
+          (i.price && i.price.amount != null ? i.price.amount : i.price) || 0
+        ),
+        variants: {}
+      }));
+    }
+
+    const totals = body.totals || {};
+    const doc = {
+      channel: 'wix',
+      orderNumber: String(orderNumber || ''),
+      _createdByWebhookAt: now,
+      createdAt: createdAtStr ? new Date(createdAtStr) : now,
+
+      customer: {
+        name:
+          buyer.name ||
+          [buyer.firstName, buyer.lastName].filter(Boolean).join(' ').trim() ||
+          '',
+        email: buyer.email || '',
+        phone: buyer.phone || '',
+        address: {
+          line1: body.address || billing.addressLine || billing.addressLine1 || '',
+          city: body.city || billing.city || '',
+          postcode: body.postalCode || billing.postalCode || ''
+        }
+      },
+
+      delivery: {},
+      supplier: {},
+      payment: { method: (body.payment && body.payment.method) || body.paymentMethod || '' },
+
+      items,
+      totals: {
+        grandTotal:
+          Number(
+            totals.total != null ? totals.total :
+            totals.grandTotal != null ? totals.grandTotal : 0
+          ),
+        shipping: Number(totals.shipping || 0),
+        discount: Number(totals.discount || 0),
+        currency: String(totals.currency || 'TRY')
+      },
+
+      notes: String(body.notes || '')
+    };
 
     const db = await getDb();
-    await db.collection("orders").insertOne(doc);
+    const result = await db.collection('orders').insertOne(doc);
 
-    return ok(res, { orderNumber: doc.orderNumber });
+    return res.status(200).json({ ok: true, orderNumber: doc.orderNumber, id: String(result.insertedId) });
   } catch (e) {
-    console.error("wix-webhook error:", e?.stack || e);
-    return res.status(500).json({ ok: false, error: "server_error" });
+    console.error('webhook error:', e);
+    return res.status(500).json({ ok: false, error: e.message || 'server_error' });
   }
-}
+};
