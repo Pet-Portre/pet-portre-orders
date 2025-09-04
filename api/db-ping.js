@@ -1,17 +1,20 @@
 // api/db-ping.js
-const { getDb } = require('../lib/db');
+const { getDB } = require('../lib/db');
 
 module.exports = async (req, res) => {
   try {
-    const db = await getDb();
-    const r = await db.command({ ping: 1 });
-    res.json({ ok: true, db: process.env.MONGODB_DB || 'Pet-Portre-Orders', ping: r?.ok === 1 });
-  } catch (e) {
+    const db = await getDB();
+    const count = await db.collection('orders').countDocuments({});
+    res.status(200).json({
+      ok: true,
+      db: process.env.MONGODB_DB,
+      count
+    });
+  } catch (err) {
     res.status(500).json({
       ok: false,
-      error: e.message,
-      name: e.name,
-      code: e.code
+      error: err.message,
+      hint: 'Check MONGODB_URI / MONGODB_DB envs and that mongodb is installed'
     });
   }
 };
