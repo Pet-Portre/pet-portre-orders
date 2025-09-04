@@ -1,8 +1,8 @@
-// api/wix-webhook.js
-// Tolerant Wix webhook -> Mongo upsert
-
+// File: api/wix-webhook.js
 const { withDb } = require('../lib/db');
-const qs = require('querystring');
+
+const pick = (obj, path, dflt) =>
+  path.split('.').reduce((o, k) => (o && o[k] !== undefined ? o[k] : undefined), obj) ?? dflt;
 
 module.exports = async (req, res) => {
   try {
@@ -11,98 +11,100 @@ module.exports = async (req, res) => {
       return res.status(405).send('POST only — wix-webhook');
     }
 
-    // --- auth (supports ?token=, x-api-key, Authorization: Bearer) ---
-    const bearer = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
-    const token =
-      req.query.token ||
-      req.headers['x-api-key'] ||
-      bearer ||
-      '';
+    // auth
+    const token = req.query.token || req.headers['x-api-key'] || '';
     if (!process.env.WIX_WEBHOOK_TOKEN || token !== process.env.WIX_WEBHOOK_TOKEN) {
       return res.status(401).json({ ok: false, error: 'Unauthorized' });
     }
 
-    // --- body parsing (json or urlencoded or raw string) ---
+    // parse body
     let body = req.body;
-    if (Buffer.isBuffer(body)) body = body.toString('utf8');
-    if (typeof body === 'string' && body.trim()) {
-      // try JSON first, then x-www-form-urlencoded
-      try { body = JSON.parse(body); }
-      catch {
-        const maybe = qs.parse(body);
-        // if parsing produced a single key with JSON value, unwrap it
-        const onlyKey = Object.keys(maybe)[0];
-        try { body = JSON.parse(maybe[onlyKey]); } catch { body = maybe; }
-      }
+    if (typeof body === 'string') {
+      try { body = JSON.parse(body); } catch { return res.status(400).json({ ok:false, error:'Invalid JSON' }); }
     }
     body = body || {};
 
-    // quick ping
-    if (body.ping === true) return res.json({ ok: true, pong: true });
+    // simple ping
+    if (body.ping) return res.json({ ok: true, pong: true });
 
-    // --- normalize incoming shapes ---
-    // Wix Automations can send:
-    // { order:{...} }  OR  { data:{...} }  OR  { payload:{ order:{...} }}  OR flat { ... }
-    const raw =
-      body.order ||
-      body.data?.order ||
-      body.data ||
-      body.payload?.order ||
-      body.payload ||
-      body;
+    // allow { order: {...} } or flattened
+    const order = body.order || body || {};
+    const number = String(order.number || order.orderNumber || '').trim();
+    if (!number) return res.status(400).json({ ok:false, error:'Missing order.number' });
 
-    // Try many candidate fields for the order number/id
-    const orderNumber =
-      raw?.number ??
-      raw?.orderNumber ??
-      raw?.id ??
-      raw?._id ??
-      raw?.orderId ??
-      raw?.reference ??
-      raw?.reference_number ??
-      raw?.referenceNumber ??
-      null;
+    // buyer/customer
+    const customer =
+      body.customer ||
+      body.buyerInfo || {
+        firstName: pick(body, 'buyerInfo.firstName', ''),
+        lastName:  pick(body, 'buyerInfo.lastName', ''),
+        email:     pick(body, 'buyerInfo.email', ''),
+        phone:     pick(body, 'buyerInfo.phone', ''),
+      };
 
-    if (!orderNumber) {
-      // minimal diagnostics that won't leak payload
-      return res.status(400).json({ ok: false, error: 'Missing order.number' });
-    }
+    // addresses (best-effort)
+    const delivery = body.delivery || body.shippingInfo || {
+      address: {
+        line1: pick(body, 'billingInfo.address.addressLine', ''),
+        city:  pick(body, 'billingInfo.address.city', ''),
+        postalCode: pick(body, 'billingInfo.address.postalCode', ''),
+        country: pick(body, 'billingInfo.address.country', ''),
+      }
+    };
 
-    // created time candidates
-    const createdAtStr =
-      raw?.createdAt ??
-      raw?.createdDate ??
-      raw?.created_time ??
-      body?.eventTime ??
-      null;
+    // items (supports many shapes)
+    let rawItems =
+      body.items ||
+      body.lineItems ||
+      pick(body, 'order.lineItems', []) ||
+      [];
 
-    const createdAt = createdAtStr ? new Date(createdAtStr) : new Date();
+    if (!Array.isArray(rawItems)) rawItems = [rawItems];
 
-    // map common fields (stay permissive)
+    const items = rawItems.map((it) => {
+      const unitPrice =
+        Number(pick(it, 'price.amount', it.unitPrice ?? it.price ?? 0)) || 0;
+      const qty = Number(it.quantity ?? it.qty ?? 1);
+      return {
+        sku: it.sku || it.code || '',
+        name: it.name || it.title || '',
+        qty,
+        unitPrice,
+        currency: pick(it, 'price.currency', body.currency || 'TRY'),
+      };
+    });
+
+    // totals (fallback compute)
+    const totals = body.totals || body.orderTotals || (() => {
+      const total = items.reduce((s, i) => s + i.unitPrice * i.qty, 0);
+      const currency = (items[0] && items[0].currency) || body.currency || 'TRY';
+      return { total, currency, shipping: 0, discount: 0 };
+    })();
+
+    // normalize doc
     const doc = {
-      orderNumber: String(orderNumber),
-      channel: raw?.channel || 'wix',
-      createdAt,
-      customer: raw?.buyerInfo || raw?.customer || body.customer || {},
-      items: raw?.lineItems || raw?.items || [],
-      totals: raw?.totals || raw?.orderTotals || {},
-      notes: raw?.notes || body.notes || '',
+      orderNumber: number,
+      channel: order.channel || 'wix',
+      createdAt: order.createdAt
+        ? new Date(order.createdAt)
+        : new Date(pick(order, 'createdDate', Date.now())),
+      customer,
+      delivery,
+      items,
+      totals,
+      notes: body.notes || '',
       _createdByWebhookAt: new Date()
     };
 
-    // --- upsert ---
     const result = await withDb(async (db) => {
       const col = db.collection('orders');
       return col.updateOne(
-        { orderNumber: doc.orderNumber },
+        { orderNumber: doc.orderNumber },                       // idempotent on order number
         {
-          $setOnInsert: {
-            orderNumber: doc.orderNumber,
-            channel: doc.channel,
-            createdAt: doc.createdAt
-          },
+          $setOnInsert: { orderNumber: doc.orderNumber, channel: doc.channel, createdAt: doc.createdAt },
           $set: {
             customer: doc.customer,
+            delivery: doc.delivery,
             items: doc.items,
             totals: doc.totals,
             notes: doc.notes,
@@ -113,7 +115,7 @@ module.exports = async (req, res) => {
       );
     });
 
-    return res.json({
+    res.json({
       ok: true,
       orderNumber: doc.orderNumber,
       upserted: result.upsertedCount === 1,
@@ -121,6 +123,6 @@ module.exports = async (req, res) => {
       modified: result.modifiedCount
     });
   } catch (err) {
-    return res.status(500).json({ ok: false, error: err.message });
+    res.status(500).json({ ok:false, error: err.message });
   }
 };
