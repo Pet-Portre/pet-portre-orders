@@ -1,5 +1,7 @@
-# Ignore everything by default
-*
-# Allow only the API folder
-!api/
-!api/**
+# keep source files, only ignore junk
+.DS_Store
+.vscode
+*.log
+node_modules
+.git
+.gitignore
