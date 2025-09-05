@@ -1,168 +1,107 @@
 // api/wix-webhook.js
 const { withDb } = require('../lib/db');
 
-/**
- * Accepts either:
- *  A) { order: {...}, buyerInfo, lineItems, totals, shippingInfo, ... }
- *  B) Entire Wix payload where order fields sit at top level
- */
+function getToken(req) {
+  const h = req.headers || {};
+  const q = req.query || {};
+  const auth = (h.authorization || '').trim(); // "Bearer xyz"
+  if (q.token) return String(q.token);
+  if (h['x-api-key']) return String(h['x-api-key']);
+  if (/^bearer\s+/i.test(auth)) return auth.replace(/^bearer\s+/i, '');
+  return '';
+}
+
+function safeJson(body) {
+  if (!body) return {};
+  if (typeof body === 'object') return body;
+  try { return JSON.parse(body); } catch { return {}; }
+}
+
+function fullName(p) {
+  if (!p) return '';
+  return p.name || [p.firstName, p.lastName].filter(Boolean).join(' ') || '';
+}
+
 module.exports = async (req, res) => {
   try {
-    // 1) Only POST + token guard
     if (req.method !== 'POST') {
       res.setHeader('Allow', 'POST');
-      return res.status(405).send('POST only — wix-webhook');
-    }
-    const token = req.query.token || req.headers['x-api-key'] || '';
-    if (process.env.WIX_WEBHOOK_TOKEN && token !== process.env.WIX_WEBHOOK_TOKEN) {
-      console.warn('wix-webhook 401: bad token');
-      return res.status(401).json({ ok: false, error: 'Unauthorized' });
+      return res.status(405).json({ ok:false, error:'POST only — wix-webhook' });
     }
 
-    // 2) Parse body (Vercel usually gives parsed JSON; handle string fallback)
-    let body = req.body;
-    if (typeof body === 'string') {
-      try { body = JSON.parse(body); } catch (e) {
-        console.error('wix-webhook invalid JSON body:', body);
-        return res.status(400).json({ ok:false, error:'Invalid JSON' });
-      }
-    }
-    body = body || {};
-
-    // 3) Ping for quick checks
-    if (body.ping) return res.json({ ok: true, pong: true });
-
-    // 4) Normalize sources (wrapped or entire)
-    const src = body.order && typeof body.order === 'object' ? body.order : body;
-
-    // 5) Extract orderNumber (try several paths)
-    const orderNumber =
-      src.number ||
-      src.orderNumber ||
-      body.number ||
-      body.orderNumber ||
-      body.id ||
-      src.id;
-
-    if (!orderNumber) {
-      console.error('wix-webhook 400: no order number. keys=', Object.keys(body || {}));
-      return res.status(400).json({ ok:false, error:'Missing order number' });
+    const expected = process.env.WIX_WEBHOOK_TOKEN || '';
+    const got = getToken(req);
+    if (!expected || got !== expected) {
+      return res.status(401).json({ ok:false, error:'Unauthorized' });
     }
 
-    // 6) Timestamps & channel
-    const createdAt =
-      src.createdAt || src.createdDate || body.createdAt || body.createdDate || new Date().toISOString();
-    const channel = (src.channel || body.channel || 'wix').toString();
+    const body = safeJson(req.body);
+    if (body.ping === true) return res.json({ ok:true, pong:true });
 
-    // 7) Customer / buyer
-    const buyer = body.buyerInfo || body.customer || src.customer || {};
-    const firstName = buyer.firstName || buyer.givenName || '';
-    const lastName  = buyer.lastName  || buyer.familyName || '';
-    const fullName  = buyer.name || [firstName, lastName].filter(Boolean).join(' ') || '';
-    const customer = {
-      name: fullName,
-      email: buyer.email || '',
-      phone: buyer.phone || buyer.phoneNumber || ''
-    };
+    // Accept both Automation JSON and Wix Stores payloads
+    const o = body.order || body;
+    const customer =
+      body.customer ||
+      o.customer ||
+      body.shippingDestinationContact ||
+      body.contactDetails ||
+      {};
 
-    // 8) Address (from common Wix shapes)
-    const ship = body.shippingInfo || body.shipping || src.shippingInfo || {};
-    const addr = ship.address || ship.shippingAddress || buyer.address || {};
-    const address = {
-      line1: addr.addressLine1 || addr.line1 || addr.address || '',
-      line2: addr.addressLine2 || addr.line2 || '',
-      city: addr.city || '',
-      district: addr.district || addr.subdistrict || '',
-      postcode: addr.postcode || addr.postalCode || '',
-      country: addr.country || addr.countryCode || ''
-    };
-    if (address.line1) customer.address = address;
+    const items =
+      Array.isArray(body.items) ? body.items :
+      Array.isArray(o.items) ? o.items :
+      Array.isArray(body.orderedItems) ? body.orderedItems : [];
 
-    // 9) Items
-    const itemsSrc = body.lineItems || body.items || src.items || [];
-    const items = Array.isArray(itemsSrc) ? itemsSrc.map(it => ({
-      sku:       it.sku || it.catalogId || '',
-      name:      it.name || it.productName || '',
-      qty:       Number(it.quantity || it.qty || 0),
-      unitPrice: Number((it.price && (it.price.amount || it.price.value)) || it.unitPrice || 0)
-    })) : [];
+    const totals = body.totals || o.totals || {};
 
-    // 10) Totals
-    const totalsSrc = body.totals || body.orderTotals || src.totals || {};
-    const totals = {
-      total: Number(
-        totalsSrc.total ??
-        totalsSrc.grandTotal ??
-        (body.totalPrice && (body.totalPrice.amount || body.totalPrice.value)) ??
-        0
-      ),
-      currency: totalsSrc.currency || body.currency || 'TRY',
-      shipping: Number(totalsSrc.shipping || 0),
-      discount: Number(totalsSrc.discount || 0)
-    };
-
-    // 11) Status / deliveredAt / shippedAt (best-effort)
-    const status =
-      body.status || src.status || ship.status || 'Bekliyor';
-    const deliveredAt = body.deliveredAt || src.deliveredAt || null;
-    const shippedAt   = body.shippedAt   || src.shippedAt   || null;
-
-    // 12) Optional notes
-    const notes = body.notes || src.notes || '';
-
-    // 13) Compose doc
     const doc = {
-      orderNumber: String(orderNumber),
-      channel,
-      createdAt: new Date(createdAt),
-      customer,
-      items,
-      totals,
-      status,
-      deliveredAt: deliveredAt ? new Date(deliveredAt) : null,
-      shippedAt:   shippedAt   ? new Date(shippedAt)   : null,
-      _createdByWebhookAt: new Date()
+      orderNumber: o.number || body.orderNumber || body['Order number'] || '',
+      createdAt:   o.createdAt || body.createdAt || body['Date created'] || new Date().toISOString(),
+      channel:     o.channel || process.env.APP_CHANNEL_DEFAULT || 'wix',
+
+      customer: {
+        name:   fullName(customer),
+        email:  customer.email || body.customerEmail || '',
+        phone:  customer.phone || body.shippingDestinationContactPhoneNumber || '',
+        // single-line address for labels & sheet
+        address: body.shippingFormattedAddress ||
+                 [body.shippingAddressLine, body.shippingAddressLine2].filter(Boolean).join(' ') ||
+                 customer.address || '',
+        city:     body.shippingAddressCity || customer.city || '',
+        district: body.shippingAddressSubdivision || customer.district || '',
+        postcode: body.shippingAddressPostalCode || customer.postalCode || ''
+      },
+
+      items: items.map(it => ({
+        sku:       it.sku || it.SKU || it.orderedItemSKU || it.catalogSku || '',
+        name:      it.name || it.orderedItemName || it.productName || '',
+        qty:       Number(it.qty || it.quantity || it.orderedItemQuantity || 1),
+        unitPrice: Number(it.unitPrice || it.price || it.totalPriceBeforeTaxValue || it.itemPrice || 0)
+      })),
+
+      totals: {
+        total:    Number((totals.total ?? body.orderTotalValue ?? body.totalPriceValue) || 0),
+        currency: totals.currency || body.orderTotalCurrency || body.totalPriceCurrency || 'TRY'
+      },
+
+      notes: body.notes || o.notes || '',
+      _createdByWebhookAt: new Date().toISOString()
     };
 
-    // 14) Upsert in Mongo
-    const result = await withDb(async (db) => {
-      const col = db.collection('orders');
-      return col.updateOne(
+    if (!doc.orderNumber) {
+      return res.status(400).json({ ok:false, error:'Missing order.number' });
+    }
+
+    await withDb(async (db) => {
+      await db.collection('orders').updateOne(
         { orderNumber: doc.orderNumber },
-        {
-          $setOnInsert: { orderNumber: doc.orderNumber, channel: doc.channel, createdAt: doc.createdAt },
-          $set: {
-            customer: doc.customer,
-            items: doc.items,
-            totals: doc.totals,
-            status: doc.status,
-            deliveredAt: doc.deliveredAt,
-            shippedAt: doc.shippedAt,
-            notes: notes,
-            _createdByWebhookAt: doc._createdByWebhookAt
-          }
-        },
+        { $setOnInsert: { orderNumber: doc.orderNumber }, $set: doc },
         { upsert: true }
       );
     });
 
-    // 15) Log to Vercel to confirm writes
-    console.log('wix-webhook upsert', {
-      orderNumber: doc.orderNumber,
-      matched: result.matchedCount,
-      modified: result.modifiedCount,
-      upserted: result.upsertedId ? true : false
-    });
-
-    return res.json({
-      ok: true,
-      orderNumber: doc.orderNumber,
-      matched: result.matchedCount,
-      modified: result.modifiedCount,
-      upserted: !!result.upsertedId
-    });
+    res.json({ ok:true, orderNumber: doc.orderNumber, upserted:true });
   } catch (err) {
-    console.error('wix-webhook error:', err);
-    return res.status(500).json({ ok:false, error: err.message });
+    res.status(500).json({ ok:false, error: err.message });
   }
 };
