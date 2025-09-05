@@ -20,82 +20,103 @@ function fmtTRDate(d) {
   return `${day}.${m}.${y} ${hh}:${mm}`;
 }
 
-function n(v) { const x = Number(v); return Number.isFinite(x) ? x : ''; }
-function str(v) { if (v === null || v === undefined) return ''; return (typeof v === 'string') ? v : String(v); }
-function pick(...cands) { for (const c of cands) { if (c !== undefined && c !== null && c !== '') return c; } return undefined; }
+function n(v) {
+  const x = Number(v);
+  return Number.isFinite(x) ? x : '';
+}
+function str(v) {
+  if (v === null || v === undefined) return '';
+  return typeof v === 'string' ? v : String(v);
+}
+function pick(...cands) {
+  for (const c of cands) {
+    if (c !== undefined && c !== null && c !== '') return c;
+  }
+  return undefined;
+}
+
+/** ---------- shipping/billing/contact helpers ---------- */
+function shipContact(doc) {
+  return (
+    doc.shippingInfo?.logistics?.shippingDestination?.contactDetails ||
+    doc.shippingInfo?.shippingDestination?.contactDetails ||
+    doc.shippingInfo?.destination?.contactDetails ||
+    doc.shippingInfo?.contactDetails ||
+    null
+  );
+}
+function shipAddressObj(doc) {
+  return (
+    doc.shippingInfo?.logistics?.shippingDestination?.address ||
+    doc.shippingInfo?.shippingDestination?.address ||
+    doc.shippingInfo?.destination?.address ||
+    doc.shippingInfo?.address ||
+    null
+  );
+}
+function billingContact(doc) { return doc.billingInfo?.contactDetails || null; }
+function contactBlock(doc)   { return doc.contact || doc.customer || null; }
 
 function getCustomerName(doc) {
-  const c = doc.customer || doc.contact || {};
-  const nameObj = c.name || {};
-  if (typeof nameObj === 'string') return nameObj;
-  const first = pick(nameObj.first, c.firstName, c.givenName);
-  const last  = pick(nameObj.last,  c.lastName,  c.familyName);
-  const full  = pick(c.name, [first, last].filter(Boolean).join(' ').trim());
-  return full || '';
+  const sc = shipContact(doc) || {};
+  const bc = billingContact(doc) || {};
+  const cc = contactBlock(doc) || {};
+  const ccName = cc.name || {};
+  const name =
+    [sc.firstName, sc.lastName].filter(Boolean).join(' ').trim() ||
+    [bc.firstName, bc.lastName].filter(Boolean).join(' ').trim() ||
+    [ccName.first, ccName.last].filter(Boolean).join(' ').trim() ||
+    str(pick(cc.name, cc.fullName));
+  return name || '';
+}
+
+function normalizeCountryTR(country) {
+  if (!country) return '';
+  return /türkiye|turkiye|turkey/i.test(country) ? 'Türkiye' : String(country);
+}
+function formatAddressLineFromParts(a) {
+  const line = [a.addressLine, a.addressLine2].filter(Boolean).join(' ');
+  const city = a.city || '';
+  const sub  = a.subdivisionFullname || a.subdivision || '';
+  const pc   = a.postalCode || '';
+  const country = normalizeCountryTR(a.countryFullname || a.country || '');
+  return [line, city, sub, pc, country].filter(Boolean).join(', ');
+}
+
+/** ONLY SHIPPING ADDRESS — no fallback */
+function getAddress(doc) {
+  const s = shipAddressObj(doc);
+  if (!s) return '';
+  const formatted = s.formattedAddressLine || s.formattedAddress || '';
+  const out = formatted || formatAddressLineFromParts(s);
+  return out.replace(/\b(Turkey|Turkiye|Türkiye)\b/gi, 'Türkiye').trim();
 }
 
 function getEmail(doc) {
-  return pick(
-    doc.customer?.email,
-    doc.buyerEmail,
-    doc.contact?.email,
-    doc.billingInfo?.contactDetails?.email
-  ) || '';
-}
-
-function getPhone(doc) {
-  return pick(
-    doc.shippingInfo?.logistics?.shippingDestination?.contactDetails?.phone,
-    doc.shippingInfo?.shippingDestination?.contactDetails?.phone,
-    doc.shippingInfo?.contactDetails?.phone,
-    doc.billingInfo?.contactDetails?.phone,
-    doc.contact?.phone,
-    doc.customer?.phone
-  ) || '';
-}
-
-function getAddress(doc) {
-  // prefer flattened address saved by webhook
-  const direct = doc.address?.formatted;
-  if (direct) return direct;
-
   return (
     pick(
-      doc.shippingInfo?.logistics?.shippingDestination?.address?.formattedAddressLine,
-      doc.shippingInfo?.shippingDestination?.address?.formattedAddressLine,
-      doc.shippingInfo?.address?.formattedAddressLine,
-      doc.contact?.address?.formattedAddress,
-      doc.billingInfo?.address?.formattedAddressLine,
-      (() => {
-        const a =
-          doc.shippingInfo?.logistics?.shippingDestination?.address ||
-          doc.shippingInfo?.shippingDestination?.address ||
-          doc.shippingInfo?.address ||
-          doc.billingInfo?.address ||
-          doc.contact?.address ||
-          doc.address ||
-          {};
-        const line = [a.addressLine, a.addressLine2].filter(Boolean).join(' ');
-        const city = a.city || '';
-        const sub  = a.subdivision || a.subdivisionFullname || '';
-        const pc   = a.postalCode || '';
-        const country = a.countryFullname || a.country || '';
-        const parts = [line, city, sub, pc, country].filter(Boolean);
-        return parts.length ? parts.join(', ') : undefined;
-      })()
+      doc.buyerEmail,
+      doc.customer?.email,
+      doc.contact?.email,
+      doc.billingInfo?.contactDetails?.email
     ) || ''
   );
 }
 
+function getPhone(doc) {
+  const sc = shipContact(doc) || {};
+  const bc = billingContact(doc) || {};
+  const cc = contactBlock(doc) || {};
+  return str(pick(sc.phone, bc.phone, cc.phone, doc.customer?.phone) || '');
+}
+
+/** ---------- items / totals ---------- */
 function extractItemFields(doc) {
-  const items =
-    Array.isArray(doc.items) ? doc.items :
-    Array.isArray(doc.lineItems) ? doc.lineItems : [];
+  const items = Array.isArray(doc.items) ? doc.items : (Array.isArray(doc.lineItems) ? doc.lineItems : []);
   const first = items[0] || {};
 
-  // options: Beden, Cinsiyet, Renk, Telefon Modeli, Tablo Boyutu
   const opt = {};
-  const rawOpts = first.options || first.modifiers || first.descriptionLines || first.description || [];
+  const rawOpts = first.options || first.modifiers || first.descriptionLines || [];
   const asArray = Array.isArray(rawOpts) ? rawOpts : [];
   for (const o of asArray) {
     const label = str(o.name || o.title || o.label || o.option || o.key).toLowerCase();
@@ -115,18 +136,18 @@ function extractItemFields(doc) {
     first.price,
     first.unitPrice?.value,
     first.priceBeforeTax?.value,
-    (first.totalPriceBeforeTax?.value && qty) ? Number(first.totalPriceBeforeTax.value) / Number(qty) : undefined
-  ) || '';
+    first.totalPriceBeforeTax?.value && qty ? Number(first.totalPriceBeforeTax.value) / Number(qty) : undefined
+  );
   const lineTotal = pick(
     first.totalPrice?.value,
     first.totalPriceBeforeTax?.value,
     (unitPrice && qty) ? Number(unitPrice) * Number(qty) : undefined
-  ) || '';
+  );
 
   return {
-    sku:  str(pick(first.sku, first.code, first.id)),
-    name: str(pick(first.name, first.title, first.description, first.itemName)),
-    qty:  n(qty),
+    sku: str(pick(first.sku, first.code, first.id)),
+    name: str(pick(first.itemName, first.name, first.title, first.description)),
+    qty: n(qty),
     unitPrice: n(unitPrice),
     lineTotal: n(lineTotal),
     ...opt
@@ -139,10 +160,7 @@ function fromTotals(doc) {
     doc.priceSummary?.shipping?.value,
     doc.shippingInfo?.price?.value
   );
-  const discount = pick(
-    doc.totals?.discount?.value,
-    doc.priceSummary?.discount?.value
-  );
+  const discount = pick(doc.totals?.discount?.value, doc.priceSummary?.discount?.value);
   const total = pick(
     doc.totals?.total?.value,
     doc.priceSummary?.total?.value,
@@ -154,6 +172,7 @@ function fromTotals(doc) {
     doc.priceSummary?.total?.currency,
     doc.priceSummary?.subtotal?.currency
   );
+
   return {
     shippingFee: n(ship),
     discount: n(discount),
@@ -164,16 +183,16 @@ function fromTotals(doc) {
 
 function dhlBits(doc) {
   return {
-    ref:       str(pick(doc.dhl?.referenceId, doc.referenceId, doc.dhlReference)),
-    carrier:   str(pick(doc.dhl?.carrier, doc.carrier, doc.shippingCarrier)),
-    tracking:  str(pick(doc.dhl?.trackingNumber, doc.trackingNumber)),
+    ref: str(pick(doc.dhl?.referenceId, doc.referenceId, doc.dhlReference)),
+    carrier: str(pick(doc.dhl?.carrier, doc.carrier, doc.shippingCarrier)),
+    tracking: str(pick(doc.dhl?.trackingNumber, doc.trackingNumber)),
     shippedAt: fmtTRDate(pick(doc.shippedAt, doc.fulfilledAt, doc.logistics?.shippedAt)),
-    status:    str(pick(doc.deliveryStatus, doc.statusText, doc.trackingStatus)),
+    status: str(pick(doc.deliveryStatus, doc.statusText, doc.trackingStatus)),
     deliveredAt: fmtTRDate(pick(doc.deliveredAt))
   };
 }
 
-/** ---------- fixed header order (must match Sheet non-editables) ---------- */
+/** ---------- fixed header order (must match Sheet) ---------- */
 const HEADERS = [
   'Sipariş No','Sipariş Tarihi','Sipariş Kanalı',
   'Tedarikçi Adı','Tedarikçi Sipariş No','Tedarikçi Kargo Firması','Tedarikçi Kargo Takip No','Tedarikçiye Veriliş Tarihi','Tedarikçiden Teslim Tarihi',
@@ -194,24 +213,23 @@ module.exports = async (req, res) => {
       return res.status(405).send('GET only — orders-flat');
     }
 
-    // --- auth (EXPORT_TOKEN preferred) ---
-    const bearer  = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
-    const provided =
-      req.query.key ||
-      req.headers['x-api-key'] ||
-      bearer || '';
+    // --- auth ---
+    const bearer   = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+    const provided = req.query.key || req.headers['x-api-key'] || bearer || '';
     const expected =
       process.env.EXPORT_TOKEN ||
       process.env.EXPORT_KEY ||
       process.env.ORDERS_EXPORT_KEY ||
-      process.env.WIX_EXPORT_KEY || '';
+      process.env.WIX_EXPORT_KEY ||
+      '';
+
     if (!expected || provided !== expected) {
       return res.status(401).json({ ok: false, error: 'Unauthorized' });
     }
 
     // --- read orders ---
     const { rows } = await withDb(async (db) => {
-      const col = db.collection('orders');
+      const col  = db.collection('orders');
       const docs = await col.find({}).sort({ createdAt: -1 }).limit(2000).toArray();
 
       const out = docs.map((doc) => {
@@ -219,22 +237,19 @@ module.exports = async (req, res) => {
         const created = fmtTRDate(doc.createdAt || doc.createdDate || doc._createdByWebhookAt);
         const channel = str((doc.channel || 'wix').toString().toLowerCase());
 
-        // IMPORTANT: supplier block has **6** placeholders (D..I)
+        // supplier-editable placeholders (D..I) — SIX columns
         const supplier = ['', '', '', '', '', ''];
 
-        const dhl = dhlBits(doc);
-        const customerName = getCustomerName(doc);
-        const address = getAddress(doc);
+        const dhl      = dhlBits(doc);
+        const custName = getCustomerName(doc);
+        const address  = getAddress(doc); // shipping-only
 
-        const item = extractItemFields(doc);
+        const item   = extractItemFields(doc);
         const totals = fromTotals(doc);
 
-        const paymentMethod = str(pick(
-          doc.payment?.method,
-          doc.paymentMethod,
-          doc.payments?.[0]?.method,
-          doc.priceSummary?.paymentMethod
-        ) || '');
+        const paymentMethod = str(
+          pick(doc.payment?.method, doc.paymentMethod, doc.payments?.[0]?.method, doc.priceSummary?.paymentMethod) || ''
+        );
 
         const email = getEmail(doc);
         const phone = getPhone(doc);
@@ -243,32 +258,22 @@ module.exports = async (req, res) => {
         return [
           // 1..3
           orderNo, created, channel,
-
-          // 4..9 (supplier editable placeholders)
+          // 4..9 (editable supplier block)
           ...supplier,
-
           // 10
           dhl.ref,
-
           // 11..12
-          customerName,
-          address,
-
+          custName, address,
           // 13..17
           item.sku, item.name, item.qty, item.unitPrice, item.lineTotal,
-
           // 18..22
           item.beden || '', item.cinsiyet || '', item.renk || '', item.telefonModeli || '', item.tabloBoyutu || '',
-
           // 23..24
           paymentMethod, totals.shippingFee,
-
           // 25..29
           dhl.carrier, dhl.tracking, dhl.shippedAt, dhl.status, dhl.deliveredAt,
-
           // 30..32
           totals.total, totals.discount, totals.currency,
-
           // 33..35
           notes, email, phone
         ];
