@@ -1,104 +1,81 @@
 // api/wix-webhook.js
-const { withDb } = require('../lib/db');
+// Receives Wix "Order placed" webhooks (or your CLI tests) and upserts into MongoDB.
 
-function pick(v, path, dflt = undefined) {
-  try {
-    return path.split('.').reduce((o, k) => (o && o[k] !== undefined ? o[k] : undefined), v) ?? dflt;
-  } catch { return dflt; }
-}
+const { withDb } = require('../lib/db'); // must export withDb(dbTask)
 
 module.exports = async (req, res) => {
   try {
+    // --- method guard ---
     if (req.method !== 'POST') {
       res.setHeader('Allow', 'POST');
       return res.status(405).send('POST only — wix-webhook');
     }
 
-    // token: allow query ?token=… OR header x-api-key
-    const token = req.query.token || req.headers['x-api-key'] || '';
+    // --- auth (token can be in query ?token= or header x-api-key) ---
+    const token =
+      (req.query && req.query.token) ||
+      req.headers['x-api-key'] ||
+      '';
     if (!process.env.WIX_WEBHOOK_TOKEN || token !== process.env.WIX_WEBHOOK_TOKEN) {
       return res.status(401).json({ ok: false, error: 'Unauthorized' });
     }
 
-    // body may already be object (Wix) or stringified
+    // --- robust body parsing (handles Buffer, string, object) ---
     let body = req.body;
+    if (Buffer.isBuffer(body)) body = body.toString('utf8');
     if (typeof body === 'string') {
-      try { body = JSON.parse(body); } catch { return res.status(400).json({ ok:false, error:'Invalid JSON' }); }
+      try { body = JSON.parse(body); }
+      catch { return res.status(400).json({ ok:false, error:'Invalid JSON' }); }
     }
-    body = body || {};
+    body = (body && typeof body === 'object') ? body : {};
 
-    // health ping
-    if (body.ping) return res.json({ ok: true, pong: true });
+    // --- health check (CLI) ---
+    if (body.ping) {
+      return res.json({ ok: true, pong: true });
+    }
 
-    // Support BOTH: your minimal {order, customer, items, totals, notes}
-    // AND Wix "entire payload" from the Order Placed trigger.
-    const isWix = !!(body._id || body.number || body.buyerInfo || body.lineItems || body.totals);
+    // --- accept minimal order payload (what we use from Wix/CLI) ---
+    // Expect body like:
+    // {
+    //   "order": { "number": "10046", "createdAt": "2025-09-04T20:19:04.273Z", "channel": "wix" },
+    //   "customer": { "name": "...", "email": "...", "phone": "..." },
+    //   "items":    [ { "sku":"...", "name":"...", "qty":1, "unitPrice":90 } ],
+    //   "totals":   { "total":90, "currency":"TRY" },
+    //   "notes":    "..."
+    // }
+    const order = body.order || {};
+    if (!order.number) {
+      return res.status(400).json({ ok:false, error:'Missing order.number' });
+    }
 
-    const orderNumber = isWix
-      ? String(body.number || body.orderNumber || '')
-      : String(pick(body, 'order.number', ''));
-
-    if (!orderNumber) return res.status(400).json({ ok:false, error:'Missing order.number' });
-
-    const createdAt = isWix
-      ? new Date(body._createdDate || body.createdDate || Date.now())
-      : (pick(body, 'order.createdAt') ? new Date(body.order.createdAt) : new Date());
-
-    const buyer = isWix ? (body.buyerInfo || {}) : (body.customer || body.buyerInfo || {});
-    const billingAddr = isWix ? pick(body, 'billingInfo.address', {}) : (body.address || {});
-    const shippingAddr = isWix ? pick(body, 'shippingInfo.address', {}) : (body.address || {});
-    const totals = isWix ? (body.totals || {}) : (body.totals || {});
-    const currency = (
-      pick(totals, 'total.currency') ||
-      pick(body, 'currency') ||
-      pick(totals, 'currency') ||
-      'TRY'
-    );
-
-    const lineItems = isWix ? (body.lineItems || []) : (body.items || body.lineItems || []);
-    const items = lineItems.map(li => ({
-      sku: li.sku || li.catalogReferenceId || '',
-      name: li.name || '',
-      qty: Number(li.quantity || li.qty || 0),
-      unitPrice: Number(pick(li, 'price.amount', li.unitPrice || 0)),
-    }));
-
+    // Normalize document to store
     const doc = {
-      orderNumber,
-      channel: (isWix ? 'wix' : (body.channel || 'wix')),
-      createdAt,
-      customer: {
-        firstName: buyer.firstName || pick(buyer, 'name', '').split(' ')[0] || '',
-        lastName:  buyer.lastName  || (pick(buyer, 'name', '').split(' ').slice(1).join(' ') || ''),
-        name:      [buyer.firstName, buyer.lastName].filter(Boolean).join(' ') || pick(buyer,'name',''),
-        email:     buyer.email || '',
-        phone:     buyer.phone || '',
-      },
-      address: {
-        line1:  pick(billingAddr, 'streetAddress.name') || billingAddr.street || billingAddr.streetAddress || pick(shippingAddr,'streetAddress.name') || '',
-        line2:  pick(billingAddr, 'addressLine2') || '',
-        city:   billingAddr.city || pick(billingAddr,'subdivision') || '',
-        postalCode: billingAddr.postalCode || billingAddr.zip || '',
-        country: billingAddr.country || billingAddr.countryCode || 'TR',
-      },
-      items,
-      totals: {
-        total: Number(pick(totals, 'total.amount', totals.total || 0)),
-        currency,
-      },
-      notes: body.notes || body.message || '',
+      orderNumber: String(order.number),
+      channel: order.channel || 'wix',
+      createdAt: order.createdAt ? new Date(order.createdAt) : new Date(),
+
+      // these can be top-level in our incoming payload
+      customer: body.customer || body.buyerInfo || {},
+      items: body.items || body.lineItems || [],
+      totals: body.totals || body.orderTotals || {},
+      notes: body.notes || '',
+
       _createdByWebhookAt: new Date()
     };
 
+    // --- upsert into Mongo ---
     const result = await withDb(async (db) => {
       const col = db.collection('orders');
       return col.updateOne(
         { orderNumber: doc.orderNumber },
         {
-          $setOnInsert: { orderNumber: doc.orderNumber, channel: doc.channel, createdAt: doc.createdAt },
+          $setOnInsert: {
+            orderNumber: doc.orderNumber,
+            channel: doc.channel,
+            createdAt: doc.createdAt
+          },
           $set: {
             customer: doc.customer,
-            address: doc.address,
             items: doc.items,
             totals: doc.totals,
             notes: doc.notes,
@@ -109,14 +86,15 @@ module.exports = async (req, res) => {
       );
     });
 
-    res.json({
+    return res.json({
       ok: true,
       orderNumber: doc.orderNumber,
       upserted: result.upsertedCount === 1,
-      matched: result.matchedCount,
-      modified: result.modifiedCount
+      matched: result.matchedCount || 0,
+      modified: result.modifiedCount || 0
     });
   } catch (err) {
+    // Surface a concise error (and keep details out of the response).
     res.status(500).json({ ok:false, error: err.message });
   }
 };
