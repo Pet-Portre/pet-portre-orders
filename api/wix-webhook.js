@@ -1,50 +1,8 @@
 // api/wix-webhook.js
-// Tolerant Wix webhook -> Mongo upsert (handles "Entire payload" + older shapes)
+// Tolerant Wix webhook -> Mongo upsert (canonicalized)
 
 const { withDb } = require('../lib/db');
 const qs = require('querystring');
-
-/* ---------- helpers ---------- */
-const isObj = (v) => v && typeof v === 'object' && !Array.isArray(v);
-const first = (...xs) => xs.find(v => v !== undefined && v !== null && v !== '');
-const asBool = (v) => v === true || String(v).toLowerCase() === 'true';
-
-// Breadth-first deep search for a key that matches a regex; returns the value at that key.
-function deepFindByKey(root, keyRegex) {
-  if (!root) return undefined;
-  const q = [root];
-  const seen = new Set();
-  while (q.length) {
-    const cur = q.shift();
-    if (!isObj(cur) && !Array.isArray(cur)) continue;
-    if (seen.has(cur)) continue;
-    seen.add(cur);
-    const keys = Object.keys(cur);
-    for (const k of keys) {
-      if (keyRegex.test(k)) return cur[k];
-      const val = cur[k];
-      if (isObj(val) || Array.isArray(val)) q.push(val);
-    }
-  }
-  return undefined;
-}
-
-// Safely coerce a date/time from many shapes
-function coerceDate(x) {
-  if (!x) return null;
-  const d = new Date(x);
-  return isNaN(d.getTime()) ? null : d;
-}
-
-// Join address parts into one line
-function joinAddress(parts) {
-  return parts
-    .map(x => (x ?? '').toString().trim())
-    .filter(Boolean)
-    .join(', ')
-    .replace(/\s+,/g, ',') // tidy accidental spaces before commas
-    .trim();
-}
 
 module.exports = async (req, res) => {
   try {
@@ -53,37 +11,32 @@ module.exports = async (req, res) => {
       return res.status(405).send('POST only — wix-webhook');
     }
 
-    /* ---------- auth ---------- */
+    // --- auth (supports ?token=, x-api-key, Authorization: Bearer) ---
     const bearer = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
     const token =
       req.query.token ||
       req.headers['x-api-key'] ||
-      bearer || '';
+      bearer ||
+      '';
     if (!process.env.WIX_WEBHOOK_TOKEN || token !== process.env.WIX_WEBHOOK_TOKEN) {
       return res.status(401).json({ ok: false, error: 'Unauthorized' });
     }
 
-    /* ---------- body parsing (json, urlencoded, raw) ---------- */
+    // --- body parsing (json or urlencoded or raw string) ---
     let body = req.body;
     if (Buffer.isBuffer(body)) body = body.toString('utf8');
-
     if (typeof body === 'string' && body.trim()) {
-      try {
-        body = JSON.parse(body);
-      } catch {
+      try { body = JSON.parse(body); }
+      catch {
         const maybe = qs.parse(body);
-        const onlyKey = Object.keys(maybe || {})[0];
-        // Sometimes Wix posts a single field whose value is JSON
+        const onlyKey = Object.keys(maybe)[0];
         try { body = JSON.parse(maybe[onlyKey]); } catch { body = maybe; }
       }
     }
     body = body || {};
+    if (body.ping === true) return res.json({ ok: true, pong: true });
 
-    // quick ping test
-    if (asBool(body.ping)) return res.json({ ok: true, pong: true });
-
-    /* ---------- normalize known wrappers ---------- */
-    // Accept: { order }, { data:{order}}, { data:{...}}, { payload:{order}}, { payload:{...}}, flat {...}
+    // --- normalize incoming shapes (order can be in several places) ---
     const raw =
       body.order ||
       body.data?.order ||
@@ -92,149 +45,143 @@ module.exports = async (req, res) => {
       body.payload ||
       body;
 
-    /* ---------- order number (look in both API-ish and human keys) ---------- */
-    let orderNumber = first(
-      raw?.number,
-      raw?.orderNumber,
-      raw?.id, raw?._id, raw?.orderId,
-      raw?.reference, raw?.reference_number, raw?.referenceNumber
-    );
-
+    // order number candidates (be generous)
+    const orderNumber =
+      raw?.number ??
+      raw?.orderNumber ??
+      raw?.id ??
+      raw?._id ??
+      raw?.orderId ??
+      raw?.reference ??
+      raw?.reference_number ??
+      raw?.referenceNumber ??
+      null;
     if (!orderNumber) {
-      // Look for human-readable key: "Order number"
-      const maybe = deepFindByKey(body, /(^|\s)order\s*number(\s|$)/i);
-      if (maybe !== undefined && maybe !== null && maybe !== '') orderNumber = maybe;
+      return res.status(400).json({ ok: false, error: 'Missing order.number' });
     }
 
-    if (!orderNumber) {
-      // as an absolute last resort, try invoice/order ids that Wix sometimes includes
-      orderNumber = first(
-        deepFindByKey(body, /(^|\s)invoice\s*id(\s|$)/i),
-        deepFindByKey(body, /(^|\s)checkout\s*id(\s|$)/i),
-        deepFindByKey(body, /(^|\s)payment\s*id(\s|$)/i),
-      );
-    }
+    // created time candidates
+    const createdAtStr =
+      raw?.createdDate ??
+      raw?.createdAt ??
+      raw?.created_time ??
+      body?.eventTime ??
+      null;
+    const createdAt = createdAtStr ? new Date(createdAtStr) : new Date();
 
-    if (!orderNumber) {
-      // Don’t generate a fake number anymore; fail fast so we spot payload shape issues
-      return res.status(400).json({ ok: false, error: 'Missing order number in payload' });
-    }
+    // ---- helpers -------------------------------------------------------
+    const first = (...vals) => vals.find(v => v !== undefined && v !== null && String(v).trim() !== '');
+    const fullName = (firstName, lastName) => [firstName, lastName].filter(Boolean).join(' ').trim();
+    const joinAddr = (a) => {
+      if (!a) return '';
+      return [
+        a.formattedAddress || a.formattedAddressLine,
+        a.addressLine,
+        a.addressLine2,
+        a.city,
+        a.subdivisionFullname || a.subdivision,
+        a.postalCode,
+        a.countryFullname || a.country
+      ].filter(Boolean).join(', ')
+        .replace(/\s+,/g, ',') // tidy
+        .replace(/,+\s*,+/g, ', ')
+        .replace(/\s{2,}/g, ' ')
+        .trim();
+    };
+    const currencyOf = (obj, k = 'currency') => (obj && (obj.currency || obj[k])) || raw?.currency || 'TRY';
 
-    /* ---------- createdAt ---------- */
-    let createdAt =
-      coerceDate(first(raw?.createdAt, raw?.createdDate, body?.eventTime)) ||
-      coerceDate(deepFindByKey(body, /date\s*created|created\s*at/i)) ||
-      new Date();
+    // contact + address (prefer shipping, then billing, then contact)
+    const shipAddr = raw?.shippingInfo?.address || null;
+    const billAddr = raw?.billingInfo?.address || null;
 
-    /* ---------- customer ---------- */
-    const customer =
-      first(raw?.buyerInfo, raw?.customer, body.customer) ||
-      {
-        // last-ditch try: “Shipping destination contact …” / “Contact …”
-        firstName: deepFindByKey(body, /shipping\s+destination\s+contact\s+first\s*name|contact\s+first\s*name/i),
-        lastName:  deepFindByKey(body, /shipping\s+destination\s+contact\s+last\s*name|contact\s+last\s*name/i),
-        email:     first(deepFindByKey(body, /customer\s*email|contact\s*email/i)),
-        phone:     first(deepFindByKey(body, /contact\s*phone|shipping\s+destination\s+contact\s+phone/i))
-      };
+    const shipContact = raw?.shippingInfo?.contactDetails || null;
+    const billContact = raw?.billingInfo?.contactDetails || null;
+    const contactRoot  = raw?.contact || null;
 
-    /* ---------- items / line items ---------- */
-    let items =
-      (Array.isArray(raw?.lineItems) ? raw.lineItems : null) ||
-      (Array.isArray(raw?.items) ? raw.items : null) ||
-      (Array.isArray(deepFindByKey(body, /ordered\s*items/i)) ? deepFindByKey(body, /ordered\s*items/i) : []);
-
-    // Normalize items minimally (SKU/name/qty/price)
-    items = (Array.isArray(items) ? items : []).map(it => ({
-      sku:
-        first(it?.sku, it?.SKU, it?.productSKU, it?.catalogReference?.sku) || '',
-      name:
-        first(it?.name, it?.productName, it?.title) || '',
-      quantity:
-        Number(first(it?.quantity, it?.qty, 1)) || 1,
-      // prefer explicit unit price; else total price before tax; else zero
-      unitPrice:
-        Number(
-          first(
-            it?.price?.value,
-            it?.priceBeforeTax?.value,
-            it?.totalPriceBeforeTax?.value // we’ll divide if we must
-          )
-        ) || 0,
-      totalPrice:
-        Number(
-          first(
-            it?.totalPrice?.value,
-            it?.totalPriceBeforeTax?.value,
-            it?.price?.value
-          )
-        ) || 0,
-      // pass through original in case we need more later
-      _raw: it
-    })).map(it => {
-      // if we only had a total but not unit, back-compute the unit
-      if (!it.unitPrice && it.totalPrice && it.quantity) {
-        it.unitPrice = Math.round((it.totalPrice / it.quantity) * 100) / 100;
-      }
-      return it;
-    });
-
-    /* ---------- address (single full string + components) ---------- */
-    const formatted = first(
-      deepFindByKey(body, /shipping\s*formatted\s*address/i),
-      deepFindByKey(body, /billing\s*formatted\s*address/i)
-    );
+    const nameFirst = first(shipContact?.firstName, billContact?.firstName, contactRoot?.name?.first);
+    const nameLast  = first(shipContact?.lastName,  billContact?.lastName,  contactRoot?.name?.last);
+    const email     = first(raw?.buyerEmail, contactRoot?.email);
+    const phone     = first(shipContact?.phone, billContact?.phone, contactRoot?.phone);
 
     const address = {
-      fullAddress: formatted || joinAddress([
-        deepFindByKey(body, /shipping\s*address\s*line\b(?!\s*\d)/i),
-        deepFindByKey(body, /shipping\s*address\s*line\s*2/i),
-        deepFindByKey(body, /shipping\s*address\s*city/i),
-        deepFindByKey(body, /shipping\s*address\s*subdivision/i),
-        deepFindByKey(body, /shipping\s*address\s*zip|postal\s*code/i),
-        deepFindByKey(body, /shipping\s*address\s*country/i)
-      ]),
-      city:        first(deepFindByKey(body, /shipping\s*address\s*city/i)),
-      region:      first(deepFindByKey(body, /shipping\s*address\s*subdivision/i)),
-      postcode:    first(deepFindByKey(body, /shipping\s*address\s*(zip|postal)\s*code/i)),
-      country:     first(deepFindByKey(body, /shipping\s*address\s*country/i))
+      full: first(
+        shipAddr?.formattedAddress || shipAddr?.formattedAddressLine,
+        billAddr?.formattedAddress || billAddr?.formattedAddressLine,
+        joinAddr(shipAddr),
+        joinAddr(billAddr)
+      ),
+      city: first(shipAddr?.city, billAddr?.city),
+      district: first(shipAddr?.subdivisionFullname, shipAddr?.subdivision, billAddr?.subdivisionFullname, billAddr?.subdivision),
+      postcode: first(shipAddr?.postalCode, billAddr?.postalCode),
+      line1: first(shipAddr?.addressLine, billAddr?.addressLine),
+      line2: first(shipAddr?.addressLine2, billAddr?.addressLine2),
+      country: first(shipAddr?.countryFullname, shipAddr?.country, billAddr?.countryFullname, billAddr?.country)
     };
 
-    /* ---------- totals ---------- */
-    const totals =
-      first(raw?.totals, raw?.orderTotals) || {
-        subtotal: deepFindByKey(body, /order\s*subtotal\s*value/i),
-        shipping: deepFindByKey(body, /order\s*total\s*shipping\s*amount\s*value|shipping\s*amount\s*value/i),
-        tax:      deepFindByKey(body, /order\s*total\s*tax\s*value|tax\s*value/i),
-        discount: deepFindByKey(body, /order\s*total\s*discount\s*value|discount\s*amount\s*value/i),
-        total:    deepFindByKey(body, /order\s*total\s*value|total\s*price\s*value/i),
-        currency: first(
-          deepFindByKey(body, /order\s*total\s*currency/i),
-          deepFindByKey(body, /total\s*price\s*currency/i),
-        )
+    // items normalization
+    const rawItems = Array.isArray(raw?.lineItems) ? raw.lineItems : (Array.isArray(raw?.items) ? raw.items : []);
+    const items = rawItems.map(li => {
+      const qty = Number(li.quantity || li.qty || 0) || 0;
+      // Compatible fields Wix may use
+      const totalValue = Number(
+        li.totalPrice?.value ??
+        li.totalPriceBeforeTax?.value ??
+        li.total?.value ??
+        li.price?.total ??
+        0
+      ) || 0;
+      const totalCurrency = currencyOf(li.totalPrice) || currencyOf(li);
+      const unitPrice = qty > 0 ? +(totalValue / qty).toFixed(2) : totalValue;
+
+      // description lines (attributes like Cinsiyet/Renk/Telefon Modeli/Tablo Boyutu)
+      const descriptionLines = Array.isArray(li.descriptionLines)
+        ? li.descriptionLines.map(d => ({ name: d.name || d.title || '', description: d.description || d.value || '' }))
+        : [];
+
+      const sku = first(li.sku, li.variant?.sku, li.catalogItem?.sku, li.product?.sku);
+
+      return {
+        id: li.id || li._id || li.itemId || undefined,
+        name: li.name || li.productName || '',
+        sku,
+        quantity: qty,
+        totalPrice: { value: totalValue, currency: totalCurrency },
+        unitPrice: { value: unitPrice, currency: totalCurrency },
+        descriptionLines
       };
+    });
 
-    /* ---------- notes ---------- */
-    const notes = first(
-      raw?.notes,
-      body?.notes,
-      deepFindByKey(body, /checkout\s*custom\s*fields/i)
-    ) || '';
+    // totals (order-level)
+    const ps = raw?.priceSummary || {};
+    const totals = {
+      total:       { value: Number(ps.total?.value ?? 0) || 0,       currency: currencyOf(ps.total) },
+      subtotal:    { value: Number(ps.subtotal?.value ?? 0) || 0,    currency: currencyOf(ps.subtotal) },
+      shipping:    { value: Number(ps.shipping?.value ?? 0) || 0,    currency: currencyOf(ps.shipping) },
+      discount:    { value: Number(ps.discount?.value ?? 0) || 0,    currency: currencyOf(ps.discount) },
+      tax:         { value: Number(ps.tax?.value ?? 0) || 0,         currency: currencyOf(ps.tax) },
+      additional:  { value: Number(ps.additionalFees?.value ?? 0) || 0, currency: currencyOf(ps.additionalFees) }
+    };
 
-    /* ---------- build doc ---------- */
     const doc = {
       orderNumber: String(orderNumber),
-      channel: raw?.channel || 'wix',
+      channel: raw?.channelType || raw?.channel || 'wix',
       createdAt,
-      customer,
+      customer: {
+        name: fullName(nameFirst, nameLast),
+        firstName: nameFirst || '',
+        lastName: nameLast || '',
+        email: email || '',
+        phone: phone || ''
+      },
       address,
       items,
       totals,
-      notes,
+      notes: raw?.notes || body.notes || '',
       _createdByWebhookAt: new Date(),
       _firstSeenAt: new Date()
     };
 
-    /* ---------- upsert ---------- */
+    // --- upsert (idempotent by orderNumber) ---
     const result = await withDb(async (db) => {
       const col = db.collection('orders');
       return col.updateOne(
