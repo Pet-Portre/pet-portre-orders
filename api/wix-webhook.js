@@ -1,115 +1,271 @@
 // api/wix-webhook.js
+// Tolerant Wix webhook -> Mongo upsert (handles "Entire payload" + older shapes)
+
 const { withDb } = require('../lib/db');
+const qs = require('querystring');
 
-const getToken = (req) =>
-  (req.query && req.query.token) ||
-  req.headers['x-api-key'] ||
-  (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+/* ---------- helpers ---------- */
+const isObj = (v) => v && typeof v === 'object' && !Array.isArray(v);
+const first = (...xs) => xs.find(v => v !== undefined && v !== null && v !== '');
+const asBool = (v) => v === true || String(v).toLowerCase() === 'true';
 
-const asObject = (b) => {
-  if (!b) return {};
-  if (typeof b === 'object') return b;
-  try { return JSON.parse(b); } catch { return {}; }
-};
-const truthy = (v) => v === true || v === 'true' || v === 1 || v === '1';
+// Breadth-first deep search for a key that matches a regex; returns the value at that key.
+function deepFindByKey(root, keyRegex) {
+  if (!root) return undefined;
+  const q = [root];
+  const seen = new Set();
+  while (q.length) {
+    const cur = q.shift();
+    if (!isObj(cur) && !Array.isArray(cur)) continue;
+    if (seen.has(cur)) continue;
+    seen.add(cur);
+    const keys = Object.keys(cur);
+    for (const k of keys) {
+      if (keyRegex.test(k)) return cur[k];
+      const val = cur[k];
+      if (isObj(val) || Array.isArray(val)) q.push(val);
+    }
+  }
+  return undefined;
+}
 
-const pick = (obj, path) =>
-  path.split('.').reduce((a, k) => (a && a[k] != null ? a[k] : undefined), obj);
+// Safely coerce a date/time from many shapes
+function coerceDate(x) {
+  if (!x) return null;
+  const d = new Date(x);
+  return isNaN(d.getTime()) ? null : d;
+}
 
-const buildDoc = (p) => {
-  const orderNumber = p['Order number'] || pick(p, 'order.number') || p.id || '';
-  const createdAt   = p['Date created'] || new Date().toISOString();
-
-  const name = p['Contact name'] ||
-    [p['Shipping destination contact first name'], p['Shipping destination contact last name']]
-      .filter(Boolean).join(' ').trim();
-
-  const email   = p['Customer email'] || p['Contact email'] || '';
-  const phone   = p['Shipping destination contact phone number'] || p['Contact phone'] || '';
-  const fullAdr = p['Shipping formatted address'] ||
-    [p['Shipping address line'], p['Shipping address line 2'], p['Shipping address city'],
-     p['Shipping address subdivision'], p['Shipping address ZIP/postal code'],
-     p['Shipping address country']].filter(Boolean).join(', ');
-
-  const items = Array.isArray(p['Ordered items']) ? p['Ordered items'] : [];
-  const it0   = items[0] || {};
-  const qty   = Number(it0['Ordered item quantity'] || 1) || 1;
-  const total = Number(it0['Ordered item total price value'] || 0) || 0;
-  let unit    = Number(it0['Ordered item price before tax value'] || 0);
-  if (!unit && qty) unit = Number((total / qty).toFixed(2));
-  const currency = it0['Ordered item total price currency'] || p['Order total currency'] || 'TRY';
-
-  return {
-    channel: 'wix',
-    orderNumber,
-    createdAt,
-    customer: {
-      name: name || '',
-      email,
-      phone,
-      address: fullAdr,
-      city: p['Shipping address city'] || '',
-      district: p['Shipping address subdivision'] || '',
-      postcode: p['Shipping address ZIP/postal code'] || ''
-    },
-    items: it0 && Object.keys(it0).length ? [{
-      sku: it0['Ordered item SKU'] || '',
-      name: it0['Ordered item name'] || '',
-      quantity: qty,
-      unitPrice: unit,
-      lineTotal: total,
-      currency
-    }] : [],
-    totals: {
-      total: Number(p['Order total value'] || total) || 0,
-      discount: Number(p['Discount amount value'] || 0) || 0,
-      shipping: Number(p['Shipping amount value'] || p['Order total shipping amount value'] || 0) || 0,
-      currency
-    },
-    notes: ''
-  };
-};
+// Join address parts into one line
+function joinAddress(parts) {
+  return parts
+    .map(x => (x ?? '').toString().trim())
+    .filter(Boolean)
+    .join(', ')
+    .replace(/\s+,/g, ',') // tidy accidental spaces before commas
+    .trim();
+}
 
 module.exports = async (req, res) => {
   try {
-    if (req.method === 'OPTIONS') return res.status(204).end();
     if (req.method !== 'POST') {
-      res.setHeader('Allow', 'POST, OPTIONS');
-      return res.status(405).json({ ok: false, error: 'POST only' });
+      res.setHeader('Allow', 'POST');
+      return res.status(405).send('POST only — wix-webhook');
     }
 
-    // auth
-    const token = getToken(req);
+    /* ---------- auth ---------- */
+    const bearer = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+    const token =
+      req.query.token ||
+      req.headers['x-api-key'] ||
+      bearer || '';
     if (!process.env.WIX_WEBHOOK_TOKEN || token !== process.env.WIX_WEBHOOK_TOKEN) {
       return res.status(401).json({ ok: false, error: 'Unauthorized' });
     }
 
-    const body = asObject(req.body);
+    /* ---------- body parsing (json, urlencoded, raw) ---------- */
+    let body = req.body;
+    if (Buffer.isBuffer(body)) body = body.toString('utf8');
 
-    // tolerant ping (accepts true or "true", query or body)
-    if (truthy(body.ping) || truthy(req.query.ping)) {
-      return res.status(200).json({ ok: true, pong: true });
+    if (typeof body === 'string' && body.trim()) {
+      try {
+        body = JSON.parse(body);
+      } catch {
+        const maybe = qs.parse(body);
+        const onlyKey = Object.keys(maybe || {})[0];
+        // Sometimes Wix posts a single field whose value is JSON
+        try { body = JSON.parse(maybe[onlyKey]); } catch { body = maybe; }
+      }
+    }
+    body = body || {};
+
+    // quick ping test
+    if (asBool(body.ping)) return res.json({ ok: true, pong: true });
+
+    /* ---------- normalize known wrappers ---------- */
+    // Accept: { order }, { data:{order}}, { data:{...}}, { payload:{order}}, { payload:{...}}, flat {...}
+    const raw =
+      body.order ||
+      body.data?.order ||
+      body.data ||
+      body.payload?.order ||
+      body.payload ||
+      body;
+
+    /* ---------- order number (look in both API-ish and human keys) ---------- */
+    let orderNumber = first(
+      raw?.number,
+      raw?.orderNumber,
+      raw?.id, raw?._id, raw?.orderId,
+      raw?.reference, raw?.reference_number, raw?.referenceNumber
+    );
+
+    if (!orderNumber) {
+      // Look for human-readable key: "Order number"
+      const maybe = deepFindByKey(body, /(^|\s)order\s*number(\s|$)/i);
+      if (maybe !== undefined && maybe !== null && maybe !== '') orderNumber = maybe;
     }
 
-    // build doc and upsert
-    let doc = buildDoc(body);
-    if (!doc.orderNumber) {
-      doc.orderNumber = 'WIX-' + Date.now();
-      doc.notes = 'Temp ID: payload had no order number';
+    if (!orderNumber) {
+      // as an absolute last resort, try invoice/order ids that Wix sometimes includes
+      orderNumber = first(
+        deepFindByKey(body, /(^|\s)invoice\s*id(\s|$)/i),
+        deepFindByKey(body, /(^|\s)checkout\s*id(\s|$)/i),
+        deepFindByKey(body, /(^|\s)payment\s*id(\s|$)/i),
+      );
     }
 
-    const writeEnabled = String(process.env.MONGODB_WRITE_ENABLED || '').toLowerCase() === 'true';
-    if (!writeEnabled) return res.status(200).json({ ok: true, dryRun: true, doc });
+    if (!orderNumber) {
+      // Don’t generate a fake number anymore; fail fast so we spot payload shape issues
+      return res.status(400).json({ ok: false, error: 'Missing order number in payload' });
+    }
 
-    await withDb(async (db) => {
-      await db.collection('orders').updateOne(
-        { channel: 'wix', orderNumber: doc.orderNumber },
-        { $setOnInsert: { _firstSeenAt: new Date() }, $set: { ...doc, _createdByWebhookAt: new Date() } },
+    /* ---------- createdAt ---------- */
+    let createdAt =
+      coerceDate(first(raw?.createdAt, raw?.createdDate, body?.eventTime)) ||
+      coerceDate(deepFindByKey(body, /date\s*created|created\s*at/i)) ||
+      new Date();
+
+    /* ---------- customer ---------- */
+    const customer =
+      first(raw?.buyerInfo, raw?.customer, body.customer) ||
+      {
+        // last-ditch try: “Shipping destination contact …” / “Contact …”
+        firstName: deepFindByKey(body, /shipping\s+destination\s+contact\s+first\s*name|contact\s+first\s*name/i),
+        lastName:  deepFindByKey(body, /shipping\s+destination\s+contact\s+last\s*name|contact\s+last\s*name/i),
+        email:     first(deepFindByKey(body, /customer\s*email|contact\s*email/i)),
+        phone:     first(deepFindByKey(body, /contact\s*phone|shipping\s+destination\s+contact\s+phone/i))
+      };
+
+    /* ---------- items / line items ---------- */
+    let items =
+      (Array.isArray(raw?.lineItems) ? raw.lineItems : null) ||
+      (Array.isArray(raw?.items) ? raw.items : null) ||
+      (Array.isArray(deepFindByKey(body, /ordered\s*items/i)) ? deepFindByKey(body, /ordered\s*items/i) : []);
+
+    // Normalize items minimally (SKU/name/qty/price)
+    items = (Array.isArray(items) ? items : []).map(it => ({
+      sku:
+        first(it?.sku, it?.SKU, it?.productSKU, it?.catalogReference?.sku) || '',
+      name:
+        first(it?.name, it?.productName, it?.title) || '',
+      quantity:
+        Number(first(it?.quantity, it?.qty, 1)) || 1,
+      // prefer explicit unit price; else total price before tax; else zero
+      unitPrice:
+        Number(
+          first(
+            it?.price?.value,
+            it?.priceBeforeTax?.value,
+            it?.totalPriceBeforeTax?.value // we’ll divide if we must
+          )
+        ) || 0,
+      totalPrice:
+        Number(
+          first(
+            it?.totalPrice?.value,
+            it?.totalPriceBeforeTax?.value,
+            it?.price?.value
+          )
+        ) || 0,
+      // pass through original in case we need more later
+      _raw: it
+    })).map(it => {
+      // if we only had a total but not unit, back-compute the unit
+      if (!it.unitPrice && it.totalPrice && it.quantity) {
+        it.unitPrice = Math.round((it.totalPrice / it.quantity) * 100) / 100;
+      }
+      return it;
+    });
+
+    /* ---------- address (single full string + components) ---------- */
+    const formatted = first(
+      deepFindByKey(body, /shipping\s*formatted\s*address/i),
+      deepFindByKey(body, /billing\s*formatted\s*address/i)
+    );
+
+    const address = {
+      fullAddress: formatted || joinAddress([
+        deepFindByKey(body, /shipping\s*address\s*line\b(?!\s*\d)/i),
+        deepFindByKey(body, /shipping\s*address\s*line\s*2/i),
+        deepFindByKey(body, /shipping\s*address\s*city/i),
+        deepFindByKey(body, /shipping\s*address\s*subdivision/i),
+        deepFindByKey(body, /shipping\s*address\s*zip|postal\s*code/i),
+        deepFindByKey(body, /shipping\s*address\s*country/i)
+      ]),
+      city:        first(deepFindByKey(body, /shipping\s*address\s*city/i)),
+      region:      first(deepFindByKey(body, /shipping\s*address\s*subdivision/i)),
+      postcode:    first(deepFindByKey(body, /shipping\s*address\s*(zip|postal)\s*code/i)),
+      country:     first(deepFindByKey(body, /shipping\s*address\s*country/i))
+    };
+
+    /* ---------- totals ---------- */
+    const totals =
+      first(raw?.totals, raw?.orderTotals) || {
+        subtotal: deepFindByKey(body, /order\s*subtotal\s*value/i),
+        shipping: deepFindByKey(body, /order\s*total\s*shipping\s*amount\s*value|shipping\s*amount\s*value/i),
+        tax:      deepFindByKey(body, /order\s*total\s*tax\s*value|tax\s*value/i),
+        discount: deepFindByKey(body, /order\s*total\s*discount\s*value|discount\s*amount\s*value/i),
+        total:    deepFindByKey(body, /order\s*total\s*value|total\s*price\s*value/i),
+        currency: first(
+          deepFindByKey(body, /order\s*total\s*currency/i),
+          deepFindByKey(body, /total\s*price\s*currency/i),
+        )
+      };
+
+    /* ---------- notes ---------- */
+    const notes = first(
+      raw?.notes,
+      body?.notes,
+      deepFindByKey(body, /checkout\s*custom\s*fields/i)
+    ) || '';
+
+    /* ---------- build doc ---------- */
+    const doc = {
+      orderNumber: String(orderNumber),
+      channel: raw?.channel || 'wix',
+      createdAt,
+      customer,
+      address,
+      items,
+      totals,
+      notes,
+      _createdByWebhookAt: new Date(),
+      _firstSeenAt: new Date()
+    };
+
+    /* ---------- upsert ---------- */
+    const result = await withDb(async (db) => {
+      const col = db.collection('orders');
+      return col.updateOne(
+        { orderNumber: doc.orderNumber },
+        {
+          $setOnInsert: {
+            orderNumber: doc.orderNumber,
+            channel: doc.channel,
+            createdAt: doc.createdAt,
+            _firstSeenAt: doc._firstSeenAt
+          },
+          $set: {
+            customer: doc.customer,
+            address: doc.address,
+            items: doc.items,
+            totals: doc.totals,
+            notes: doc.notes,
+            _createdByWebhookAt: doc._createdByWebhookAt
+          }
+        },
         { upsert: true }
       );
     });
 
-    return res.status(200).json({ ok: true, orderNumber: doc.orderNumber });
+    return res.json({
+      ok: true,
+      orderNumber: doc.orderNumber,
+      upserted: result.upsertedCount === 1,
+      matched: result.matchedCount,
+      modified: result.modifiedCount
+    });
   } catch (err) {
     return res.status(500).json({ ok: false, error: err.message });
   }
