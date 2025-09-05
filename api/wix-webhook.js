@@ -1,165 +1,22 @@
 // api/wix-webhook.js
-// Robust Wix webhook → Mongo upsert (Order placed / Invoice paid "Entire payload")
+// Tolerant Wix webhook -> Mongo upsert (with phone mapping)
 
 const { withDb } = require('../lib/db');
 const qs = require('querystring');
 
-function toStringSafe(v) {
-  if (v == null) return '';
-  if (typeof v === 'string') return v;
-  try { return JSON.stringify(v); } catch { return String(v); }
-}
-function num(v) { const n = Number(v); return Number.isFinite(n) ? n : undefined; }
-
-// Pull common fields from Wix "Entire payload"
-function normalizeFromRaw(raw) {
-  // Order number & created date
-  const orderNumber =
-      raw?.orderNumber ??
-      raw?.number ??
-      raw?.id ??
-      raw?._id ??
-      raw?.referenceNumber ??
-      raw?.reference ??
-      null;
-
-  // Created time
-  const createdAtStr =
-      raw?.createdDate ??
-      raw?.createdAt ??
-      raw?.dateCreated ??
-      raw?.eventTime ??
-      null;
-
-  // Contact / email / phone
-  const buyerEmail = raw?.buyerEmail || raw?.contact?.email || '';
-  const contactFirst = raw?.contact?.name?.first || raw?.shippingInfo?.shippingDestination?.contactDetails?.firstName || '';
-  const contactLast  = raw?.contact?.name?.last  || raw?.shippingInfo?.shippingDestination?.contactDetails?.lastName  || '';
-  const contactPhone =
-      raw?.shippingInfo?.shippingDestination?.contactDetails?.phone ||
-      raw?.contact?.phone || '';
-
-  const customerName = [contactFirst, contactLast].filter(Boolean).join(' ').trim();
-
-  // Address (prefer formatted)
-  const ship = raw?.shippingInfo || {};
-  const addr = ship.address || {};
-  const fullAddress =
-      addr.formattedAddress ||
-      addr.formattedAddressLine ||
-      [
-        addr.addressLine, addr.addressLine2,
-        addr.city, addr.subdivisionFullname || addr.subdivision,
-        addr.postalCode, addr.countryFullname || addr.country
-      ].filter(Boolean).join(', ');
-
-  // Line items (use first for “1 row per order”)
-  const items = Array.isArray(raw?.lineItems) ? raw.lineItems : [];
-  const first = items[0] || {};
-  const descLines = Array.isArray(first?.descriptionLines) ? first.descriptionLines : [];
-  const descMap = {};
-  descLines.forEach(d => {
-    const k = toStringSafe(d?.name || '').trim().toLowerCase();
-    const v = toStringSafe(d?.description || '').trim();
-    if (k) descMap[k] = v;
-  });
-
-  // Quantities & prices
-  const qty = num(first?.quantity) ?? 0;
-  const lineTotal =
-      num(first?.totalPrice?.value) ??
-      num(first?.totalPriceValue) ??
-      num(first?.price?.total?.value) ?? 0;
-  const unitPrice =
-      num(first?.unitPrice?.value) ??
-      (qty && lineTotal ? Math.round((lineTotal / qty) * 100) / 100 : undefined);
-
-  // Currency
-  const currency =
-      first?.totalPrice?.currency ||
-      first?.price?.total?.currency ||
-      raw?.priceSummary?.total?.currency ||
-      raw?.currency || 'TRY';
-
-  // Order totals / discount / shipping
-  const orderTotal =
-      num(raw?.priceSummary?.total?.value) ??
-      num(raw?.orderTotal?.value) ??
-      num(raw?.priceSummary?.total) ?? 0;
-
-  const discountTotal =
-      num(raw?.priceSummary?.discount?.value) ??
-      (Array.isArray(raw?.appliedDiscounts)
-        ? raw.appliedDiscounts.reduce((s, d) => s + (num(d?.amount?.value) || 0), 0)
-        : 0);
-
-  const shippingAmount =
-      num(ship?.amount?.value) ??
-      num(raw?.priceSummary?.shipping?.value) ?? 0;
-
-  // Payment method (best effort)
-  const payments = Array.isArray(raw?.payments) ? raw.payments : [];
-  const paymentMethod =
-      payments[0]?.paymentMethod ||
-      payments[0]?.paymentGateway ||
-      payments[0]?.provider ||
-      raw?.paymentStatus || '';
-
-  return {
-    ok: !!orderNumber,
-    orderNumber: orderNumber ? String(orderNumber) : null,
-    createdAt: createdAtStr ? new Date(createdAtStr) : new Date(),
-    channel: raw?.channelType || raw?.channel || 'wix',
-
-    // customer & address
-    customer: {
-      name: customerName || undefined,
-      email: buyerEmail || undefined,
-      phone: contactPhone || undefined
-    },
-    address: { full: fullAddress || undefined },
-
-    // 1st line-item summary (we still store all)
-    items: items,
-    firstItem: {
-      sku: first?.sku || first?.catalogItemSku || '',
-      name: first?.name || first?.productName || '',
-      quantity: qty || undefined,
-      unitPrice: unitPrice,
-      lineTotal: lineTotal,
-      currency,
-      attributes: {
-        beden: descMap['beden'],
-        cinsiyet: descMap['cinsiyet'],
-        renk: descMap['renk'] || descMap['color'],
-        telefonModeli: descMap['telefon modeli'],
-        tabloBoyutu: descMap['tablo boyutu']
-      },
-      descriptionLines: descLines
-    },
-
-    // order totals
-    totals: {
-      orderTotal,
-      discountTotal: discountTotal || 0,
-      currency
-    },
-    shipping: {
-      amount: shippingAmount || 0,
-      currency
-    },
-    payment: {
-      method: paymentMethod || ''
-    },
-
-    notes: (raw?.checkoutCustomFields
-      ? toStringSafe(raw.checkoutCustomFields)
-      : (first?.description || '')
-    ) || '',
-
-    // raw for future-proofing
-    _raw: raw
-  };
+function pickPhone(raw) {
+  const p =
+    raw?.shippingInfo?.shippingDestination?.contactDetails?.phone ||
+    raw?.billingInfo?.contactDetails?.phone ||
+    raw?.contact?.phone ||
+    raw?.buyerInfo?.phone ||
+    '';
+  const digits = String(p).replace(/\D+/g, '');
+  if (!digits) return '';
+  if (digits.length === 11 && digits.startsWith('0')) return digits;           // 0XXXXXXXXXX
+  if (digits.length === 10) return '0' + digits;                               // XXXXXXXXXX -> 0XXXXXXXXXX
+  if (digits.length === 12 && digits.startsWith('90')) return '0' + digits.slice(2); // 90XXXXXXXXXX -> 0XXXXXXXXXX
+  return digits;
 }
 
 module.exports = async (req, res) => {
@@ -169,14 +26,18 @@ module.exports = async (req, res) => {
       return res.status(405).send('POST only — wix-webhook');
     }
 
-    // --- Auth (token can be in ?token=, x-api-key, or Bearer) ---
+    // --- auth (supports ?token=, x-api-key, Authorization: Bearer) ---
     const bearer = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
-    const token = req.query.token || req.headers['x-api-key'] || bearer || '';
+    const token =
+      req.query.token ||
+      req.headers['x-api-key'] ||
+      bearer ||
+      '';
     if (!process.env.WIX_WEBHOOK_TOKEN || token !== process.env.WIX_WEBHOOK_TOKEN) {
       return res.status(401).json({ ok: false, error: 'Unauthorized' });
     }
 
-    // --- Parse body (JSON / x-www-form-urlencoded / raw) ---
+    // --- body parsing (json or urlencoded or raw string) ---
     let body = req.body;
     if (Buffer.isBuffer(body)) body = body.toString('utf8');
     if (typeof body === 'string' && body.trim()) {
@@ -188,9 +49,11 @@ module.exports = async (req, res) => {
       }
     }
     body = body || {};
+
+    // quick ping
     if (body.ping === true) return res.json({ ok: true, pong: true });
 
-    // Wix can wrap order as {order}, {data}, {payload:{order}}, or flat
+    // --- normalize incoming shapes ---
     const raw =
       body.order ||
       body.data?.order ||
@@ -199,34 +62,72 @@ module.exports = async (req, res) => {
       body.payload ||
       body;
 
-    const norm = normalizeFromRaw(raw);
-    if (!norm.ok) return res.status(400).json({ ok: false, error: 'Missing orderNumber' });
+    // order number candidates
+    const orderNumber =
+      raw?.number ??
+      raw?.orderNumber ??
+      raw?.id ??
+      raw?._id ??
+      raw?.orderId ??
+      raw?.reference ??
+      raw?.reference_number ??
+      raw?.referenceNumber ??
+      null;
 
-    // --- Upsert in Mongo ---
+    if (!orderNumber) {
+      return res.status(400).json({ ok: false, error: 'Missing order.number' });
+    }
+
+    // created time candidates
+    const createdAtStr =
+      raw?.createdAt ??
+      raw?.createdDate ??
+      raw?.created_time ??
+      body?.eventTime ??
+      null;
+
+    const createdAt = createdAtStr ? new Date(createdAtStr) : new Date();
+
+    // map common fields (permissive)
+    const doc = {
+      orderNumber: String(orderNumber),
+      channel: raw?.channel || raw?.channelType || 'wix',
+      createdAt,
+      customer: raw?.buyerInfo || raw?.customer || body.customer || {},
+      items: raw?.lineItems || raw?.items || [],
+      totals: raw?.totals || raw?.orderTotals || raw?.priceSummary || {},
+      notes: raw?.notes || body.notes || '',
+      _createdByWebhookAt: new Date()
+    };
+
+    // ensure customer.phone is populated
+    const phone = pickPhone(raw);
+    if (phone) {
+      doc.customer = { ...(doc.customer || {}), phone };
+    }
+    // try to keep email if visible at top-level payload
+    if (!doc.customer?.email) {
+      const email = raw?.buyerEmail || raw?.contact?.email || '';
+      if (email) doc.customer.email = email;
+    }
+
+    // --- upsert ---
     const result = await withDb(async (db) => {
       const col = db.collection('orders');
-      const now = new Date();
-
       return col.updateOne(
-        { orderNumber: String(norm.orderNumber) },
+        { orderNumber: doc.orderNumber },
         {
           $setOnInsert: {
-            orderNumber: String(norm.orderNumber),
-            channel: norm.channel || 'wix',
-            createdAt: norm.createdAt,
-            _firstSeenAt: now
+            orderNumber: doc.orderNumber,
+            channel: doc.channel,
+            createdAt: doc.createdAt
           },
           $set: {
-            customer: norm.customer,
-            address: norm.address,
-            items: norm.items,
-            firstItem: norm.firstItem,
-            totals: norm.totals,
-            shipping: norm.shipping,
-            payment: norm.payment,
-            notes: norm.notes,
-            _createdByWebhookAt: now,
-            _raw: norm._raw
+            customer: doc.customer,
+            items: doc.items,
+            totals: doc.totals,
+            notes: doc.notes,
+            _createdByWebhookAt: doc._createdByWebhookAt
           }
         },
         { upsert: true }
@@ -235,7 +136,7 @@ module.exports = async (req, res) => {
 
     return res.json({
       ok: true,
-      orderNumber: norm.orderNumber,
+      orderNumber: doc.orderNumber,
       upserted: result.upsertedCount === 1,
       matched: result.matchedCount,
       modified: result.modifiedCount
