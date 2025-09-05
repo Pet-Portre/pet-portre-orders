@@ -24,6 +24,14 @@ function n(v) {
   const x = Number(v);
   return Number.isFinite(x) ? x : '';
 }
+function nn(v, def = 0) {
+  const x = Number(v);
+  return Number.isFinite(x) ? x : def;
+}
+function numOrNull(v) {
+  const x = Number(v);
+  return Number.isFinite(x) ? x : null;
+}
 function str(v) {
   if (v === null || v === undefined) return '';
   return typeof v === 'string' ? v : String(v);
@@ -154,18 +162,52 @@ function extractItemFields(doc) {
   };
 }
 
+function computeTotalIfMissing(doc) {
+  // Sum line items (prefer totalPrice.value, else totalPriceBeforeTax.value)
+  const items = Array.isArray(doc.items) ? doc.items : (Array.isArray(doc.lineItems) ? doc.lineItems : []);
+  let sum = 0;
+  let hadAny = false;
+  for (const it of items) {
+    const v = numOrNull(it?.totalPrice?.value) ?? numOrNull(it?.totalPriceBeforeTax?.value);
+    if (v !== null) { sum += v; hadAny = true; }
+  }
+  if (!hadAny) return null;
+
+  const ship = numOrNull(
+    doc.totals?.shipping?.value ??
+    doc.priceSummary?.shipping?.value ??
+    doc.shippingInfo?.price?.value
+  ) ?? 0;
+
+  const disc = numOrNull(
+    doc.totals?.discount?.value ??
+    doc.priceSummary?.discount?.value
+  ) ?? 0;
+
+  return sum + ship - disc;
+}
+
 function fromTotals(doc) {
   const ship = pick(
     doc.totals?.shipping?.value,
     doc.priceSummary?.shipping?.value,
     doc.shippingInfo?.price?.value
   );
-  const discount = pick(doc.totals?.discount?.value, doc.priceSummary?.discount?.value);
-  const total = pick(
+  const discount = pick(
+    doc.totals?.discount?.value,
+    doc.priceSummary?.discount?.value
+  );
+  let total = pick(
     doc.totals?.total?.value,
     doc.priceSummary?.total?.value,
     doc.orderTotal?.value
   );
+
+  // If total is missing/blank, try compute; finally default to 0
+  const computed = computeTotalIfMissing(doc);
+  if (!(Number.isFinite(Number(total)))) total = computed;
+  const totalOut = nn(total, 0); // ← never blank, 0 when undefined
+
   const currency = pick(
     doc.currency,
     doc.totals?.total?.currency,
@@ -176,7 +218,7 @@ function fromTotals(doc) {
   return {
     shippingFee: n(ship),
     discount: n(discount),
-    total: n(total),
+    total: totalOut,
     currency: str(currency || 'TRY')
   };
 }
