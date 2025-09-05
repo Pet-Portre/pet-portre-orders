@@ -1,23 +1,10 @@
 // api/wix-webhook.js
-// Tolerant Wix webhook -> Mongo upsert (with phone mapping)
+// Tolerant Wix webhook -> Mongo upsert (captures proper name + address)
+
+'use strict';
 
 const { withDb } = require('../lib/db');
 const qs = require('querystring');
-
-function pickPhone(raw) {
-  const p =
-    raw?.shippingInfo?.shippingDestination?.contactDetails?.phone ||
-    raw?.billingInfo?.contactDetails?.phone ||
-    raw?.contact?.phone ||
-    raw?.buyerInfo?.phone ||
-    '';
-  const digits = String(p).replace(/\D+/g, '');
-  if (!digits) return '';
-  if (digits.length === 11 && digits.startsWith('0')) return digits;           // 0XXXXXXXXXX
-  if (digits.length === 10) return '0' + digits;                               // XXXXXXXXXX -> 0XXXXXXXXXX
-  if (digits.length === 12 && digits.startsWith('90')) return '0' + digits.slice(2); // 90XXXXXXXXXX -> 0XXXXXXXXXX
-  return digits;
-}
 
 module.exports = async (req, res) => {
   try {
@@ -26,18 +13,14 @@ module.exports = async (req, res) => {
       return res.status(405).send('POST only — wix-webhook');
     }
 
-    // --- auth (supports ?token=, x-api-key, Authorization: Bearer) ---
+    // --- auth: ?token= | x-api-key | Authorization: Bearer ---
     const bearer = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
-    const token =
-      req.query.token ||
-      req.headers['x-api-key'] ||
-      bearer ||
-      '';
+    const token = req.query.token || req.headers['x-api-key'] || bearer || '';
     if (!process.env.WIX_WEBHOOK_TOKEN || token !== process.env.WIX_WEBHOOK_TOKEN) {
       return res.status(401).json({ ok: false, error: 'Unauthorized' });
     }
 
-    // --- body parsing (json or urlencoded or raw string) ---
+    // --- parse body (json, urlencoded, or raw) ---
     let body = req.body;
     if (Buffer.isBuffer(body)) body = body.toString('utf8');
     if (typeof body === 'string' && body.trim()) {
@@ -49,11 +32,9 @@ module.exports = async (req, res) => {
       }
     }
     body = body || {};
-
-    // quick ping
     if (body.ping === true) return res.json({ ok: true, pong: true });
 
-    // --- normalize incoming shapes ---
+    // --- normalize shapes ---
     const raw =
       body.order ||
       body.data?.order ||
@@ -62,7 +43,7 @@ module.exports = async (req, res) => {
       body.payload ||
       body;
 
-    // order number candidates
+    // order number / id
     const orderNumber =
       raw?.number ??
       raw?.orderNumber ??
@@ -78,38 +59,89 @@ module.exports = async (req, res) => {
       return res.status(400).json({ ok: false, error: 'Missing order.number' });
     }
 
-    // created time candidates
+    // created time
     const createdAtStr =
       raw?.createdAt ??
       raw?.createdDate ??
       raw?.created_time ??
       body?.eventTime ??
       null;
-
     const createdAt = createdAtStr ? new Date(createdAtStr) : new Date();
 
-    // map common fields (permissive)
-    const doc = {
-      orderNumber: String(orderNumber),
-      channel: raw?.channel || raw?.channelType || 'wix',
-      createdAt,
-      customer: raw?.buyerInfo || raw?.customer || body.customer || {},
-      items: raw?.lineItems || raw?.items || [],
-      totals: raw?.totals || raw?.orderTotals || raw?.priceSummary || {},
-      notes: raw?.notes || body.notes || '',
-      _createdByWebhookAt: new Date()
+    // ---- derive customer/contact + shipping address ----
+    const contact = raw?.contact || {};
+    const nameObj = contact?.name || {};
+    const firstName =
+      nameObj?.first ||
+      contact?.firstName ||
+      raw?.billingInfo?.contactDetails?.firstName ||
+      '';
+    const lastName =
+      nameObj?.last ||
+      contact?.lastName ||
+      raw?.billingInfo?.contactDetails?.lastName ||
+      '';
+    const fullName = [firstName, lastName].filter(Boolean).join(' ').trim();
+
+    const shipContact =
+      raw?.shippingInfo?.logistics?.shippingDestination?.contactDetails ||
+      raw?.shippingInfo?.shippingDestination?.contactDetails || {};
+
+    const email =
+      raw?.buyerEmail ||
+      contact?.email ||
+      raw?.billingInfo?.contactDetails?.email ||
+      '';
+
+    const phone =
+      shipContact?.phone ||
+      contact?.phone ||
+      raw?.billingInfo?.contactDetails?.phone ||
+      '';
+
+    const addrSrc =
+      raw?.shippingInfo?.logistics?.shippingDestination?.address ||
+      raw?.shippingInfo?.shippingDestination?.address ||
+      contact?.address ||
+      raw?.billingInfo?.address ||
+      {};
+
+    const address = {
+      formatted:
+        addrSrc?.formattedAddressLine ||
+        contact?.address?.formattedAddress ||
+        '',
+      addressLine: addrSrc?.addressLine || '',
+      addressLine2: addrSrc?.addressLine2 || '',
+      city: addrSrc?.city || '',
+      subdivision: addrSrc?.subdivisionFullname || addrSrc?.subdivision || '',
+      postalCode: addrSrc?.postalCode || '',
+      country: addrSrc?.countryFullname || addrSrc?.country || ''
     };
 
-    // ensure customer.phone is populated
-    const phone = pickPhone(raw);
-    if (phone) {
-      doc.customer = { ...(doc.customer || {}), phone };
-    }
-    // try to keep email if visible at top-level payload
-    if (!doc.customer?.email) {
-      const email = raw?.buyerEmail || raw?.contact?.email || '';
-      if (email) doc.customer.email = email;
-    }
+    // map core fields
+    const doc = {
+      orderNumber: String(orderNumber),
+      channel: raw?.channel || 'wix',
+      createdAt,
+
+      customer: {
+        ...(raw?.buyerInfo || raw?.customer || {}),
+        name: fullName || (raw?.buyerInfo?.name) || '',
+        email,
+        phone
+      },
+
+      items: raw?.lineItems || raw?.items || [],
+      totals: raw?.totals || raw?.orderTotals || {},
+      notes: raw?.notes || body?.notes || '',
+
+      // store these for the exporter
+      contact,
+      shippingInfo: raw?.shippingInfo || {},
+      address,
+      _createdByWebhookAt: new Date()
+    };
 
     // --- upsert ---
     const result = await withDb(async (db) => {
@@ -127,6 +159,9 @@ module.exports = async (req, res) => {
             items: doc.items,
             totals: doc.totals,
             notes: doc.notes,
+            contact: doc.contact,
+            shippingInfo: doc.shippingInfo,
+            address: doc.address,
             _createdByWebhookAt: doc._createdByWebhookAt
           }
         },
