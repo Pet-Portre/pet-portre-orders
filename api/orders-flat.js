@@ -42,6 +42,15 @@ function pick(...cands) {
   }
   return undefined;
 }
+function sumBy(arr, get) {
+  if (!Array.isArray(arr)) return null;
+  let any = false, total = 0;
+  for (const x of arr) {
+    const v = numOrNull(get(x));
+    if (v !== null) { total += v; any = true; }
+  }
+  return any ? total : null;
+}
 
 /** ---------- shipping/billing/contact helpers ---------- */
 function shipContact(doc) {
@@ -163,15 +172,14 @@ function extractItemFields(doc) {
 }
 
 function computeTotalIfMissing(doc) {
-  // Sum line items (prefer totalPrice.value, else totalPriceBeforeTax.value)
   const items = Array.isArray(doc.items) ? doc.items : (Array.isArray(doc.lineItems) ? doc.lineItems : []);
   let sum = 0;
-  let hadAny = false;
+  let any = false;
   for (const it of items) {
     const v = numOrNull(it?.totalPrice?.value) ?? numOrNull(it?.totalPriceBeforeTax?.value);
-    if (v !== null) { sum += v; hadAny = true; }
+    if (v !== null) { sum += v; any = true; }
   }
-  if (!hadAny) return null;
+  if (!any) return null;
 
   const ship = numOrNull(
     doc.totals?.shipping?.value ??
@@ -188,38 +196,54 @@ function computeTotalIfMissing(doc) {
 }
 
 function fromTotals(doc) {
-  const ship = pick(
-    doc.totals?.shipping?.value,
-    doc.priceSummary?.shipping?.value,
-    doc.shippingInfo?.price?.value
+  // shipping fee (keep as is, allow 0)
+  const shippingFee = nn(
+    pick(
+      doc.totals?.shipping?.value,
+      doc.priceSummary?.shipping?.value,
+      doc.shippingInfo?.price?.value
+    ),
+    0
   );
-  const discount = pick(
-    doc.totals?.discount?.value,
-    doc.priceSummary?.discount?.value
+
+  // discount: try multiple places, ensure numeric 0 fallback
+  const discPrimary = pick(
+    doc.priceSummary?.discount?.value,
+    doc.totals?.discount?.value
   );
+  const discApplied = sumBy(doc.appliedDiscounts, d => d?.amount?.value);
+  const discItems   = sumBy(
+    Array.isArray(doc.lineItems) ? doc.lineItems : doc.items,
+    it => it?.totalDiscount?.value
+  );
+  const discount = nn(pick(discPrimary, discApplied, discItems), 0);
+
+  // total: first canonical totals/priceSummary, else compute, else 0
   let total = pick(
-    doc.totals?.total?.value,
     doc.priceSummary?.total?.value,
+    doc.totals?.total?.value,
     doc.orderTotal?.value
   );
+  if (!(Number.isFinite(Number(total)))) {
+    const computed = computeTotalIfMissing(doc);
+    total = computed;
+  }
+  const totalOut = nn(total, 0);
 
-  // If total is missing/blank, try compute; finally default to 0
-  const computed = computeTotalIfMissing(doc);
-  if (!(Number.isFinite(Number(total)))) total = computed;
-  const totalOut = nn(total, 0); // ← never blank, 0 when undefined
-
-  const currency = pick(
-    doc.currency,
-    doc.totals?.total?.currency,
-    doc.priceSummary?.total?.currency,
-    doc.priceSummary?.subtotal?.currency
+  const currency = str(
+    pick(
+      doc.currency,
+      doc.totals?.total?.currency,
+      doc.priceSummary?.total?.currency,
+      doc.priceSummary?.subtotal?.currency
+    ) || 'TRY'
   );
 
   return {
-    shippingFee: n(ship),
-    discount: n(discount),
+    shippingFee,
+    discount,
     total: totalOut,
-    currency: str(currency || 'TRY')
+    currency
   };
 }
 
@@ -314,7 +338,7 @@ module.exports = async (req, res) => {
           paymentMethod, totals.shippingFee,
           // 25..29
           dhl.carrier, dhl.tracking, dhl.shippedAt, dhl.status, dhl.deliveredAt,
-          // 30..32
+          // 30..32  <-- focus area: guaranteed numeric
           totals.total, totals.discount, totals.currency,
           // 33..35
           notes, email, phone
