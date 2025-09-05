@@ -206,17 +206,21 @@ function fromTotals(doc) {
     0
   );
 
-  // discount: try multiple places, ensure numeric 0 fallback
+  // ---- ONLY CHANGE: make sure coupon amounts are included in discount ----
   const discPrimary = pick(
     doc.priceSummary?.discount?.value,
     doc.totals?.discount?.value
   );
-  const discApplied = sumBy(doc.appliedDiscounts, d => d?.amount?.value);
+  const discApplied = sumBy(
+    doc.appliedDiscounts,
+    d => d?.amount?.value ?? d?.coupon?.amount?.value
+  );
   const discItems   = sumBy(
     Array.isArray(doc.lineItems) ? doc.lineItems : doc.items,
     it => it?.totalDiscount?.value
   );
   const discount = nn(pick(discPrimary, discApplied, discItems), 0);
+  // -----------------------------------------------------------------------
 
   // total: first canonical totals/priceSummary, else compute, else 0
   let total = pick(
@@ -338,7 +342,7 @@ module.exports = async (req, res) => {
           paymentMethod, totals.shippingFee,
           // 25..29
           dhl.carrier, dhl.tracking, dhl.shippedAt, dhl.status, dhl.deliveredAt,
-          // 30..32  <-- focus area: guaranteed numeric
+          // 30..32  (ONLY these two were adjusted via fromTotals)
           totals.total, totals.discount, totals.currency,
           // 33..35
           notes, email, phone
