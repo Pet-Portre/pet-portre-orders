@@ -1,13 +1,66 @@
 // api/orders-flat.js
 const { withDb } = require('../lib/db');
 
+// Turkish headers expected by your Google Sheet
 const HEADERS = [
-  'orderNumber','createdAt','channel',
-  'customerName','customerEmail','customerPhone',
-  'addrLine1','addrLine2','city','postalCode','country',
-  'itemSKU','itemName','itemQty','itemUnitPrice',
-  'orderTotal','currency','notes'
+  'Sipariş No',
+  'Sipariş Tarihi',
+  'Sipariş Kanalı',
+  'Tedarikçi Adı',
+  'DHL Referans No',
+  'Müşteri Adı',
+  'Adres',
+  'İl',
+  'İlçe',
+  'Posta Kodu',
+  'Telefon',
+  'E-posta',
+  'Kargo Firması',
+  'Kargo Takip No',
+  'Kargoya Veriliş Tarihi',
+  'Teslimat Durumu',
+  'Teslimat Tarihi',
+  'Kargo Etiket PDF',     // sheet fills this after label print
+  'SKU',
+  'Ürün',
+  'Birim Fiyat',
+  'Ürün Toplam Fiyat',
+  'Notlar'
 ];
+
+// ---------- helpers ----------
+function first(arr, field, fallback = '') {
+  if (!Array.isArray(arr) || !arr.length) return fallback;
+  const v = arr[0]?.[field];
+  return v == null ? fallback : v;
+}
+function joinAddr(c) {
+  if (!c) return '';
+  const a1 = c.addrLine1 || c.address || '';
+  const a2 = c.addrLine2 || '';
+  return [a1, a2].filter(Boolean).join(' ');
+}
+function getCity(doc) {
+  const c = doc.customer || {};
+  return c.city || c.address?.city || '';
+}
+function getDistrict(doc) {
+  const c = doc.customer || {};
+  return c.district || c.address?.district || '';
+}
+function getPostcode(doc) {
+  const c = doc.customer || {};
+  return c.postcode || c.postalCode || c.address?.postcode || '';
+}
+function normStatus(s) {
+  if (!s) return 'Bekliyor';
+  const v = String(s).toLowerCase();
+  if (v.includes('deliver')) return 'Teslim Edildi';
+  if (v.includes('create') || v.includes('label')) return 'CREATED';
+  if (v.includes('ship') || v.includes('transit')) return 'Kargoda';
+  return s;
+}
+// --------------------------------
 
 module.exports = async (req, res) => {
   try {
@@ -16,53 +69,57 @@ module.exports = async (req, res) => {
       return res.status(405).send('GET only — orders-flat');
     }
 
+    // accept either env var name for compatibility
+    const exportSecret = process.env.EXPORT_KEY || process.env.EXPORT_TOKEN;
     const key = req.query.key || req.headers['x-api-key'] || '';
-    if (!process.env.EXPORT_TOKEN || key !== process.env.EXPORT_TOKEN) {
-      return res.status(401).json({ ok:false, error: 'Unauthorized' });
+    if (!exportSecret || key !== exportSecret) {
+      return res.status(401).json({ ok: false, error: 'Unauthorized' });
     }
 
+    const supplier = process.env.SUPPLIER_NAME || 'tom flatman';
+
     const rows = await withDb(async (db) => {
-      const col = db.collection('orders');
-      const docs = await col
-        .find({}, { sort: { createdAt: -1 } })
+      const docs = await db.collection('orders')
+        .find({})
+        .sort({ createdAt: -1 })
+        .limit(5000)
         .toArray();
 
-      const out = [];
-      for (const d of docs) {
-        const base = {
-          orderNumber: d.orderNumber || '',
-          createdAt: new Date(d.createdAt || d._createdByWebhookAt || Date.now()).toISOString(),
-          channel: d.channel || 'wix',
-          customerName: d.customer?.name || [d.customer?.firstName, d.customer?.lastName].filter(Boolean).join(' ') || '',
-          customerEmail: d.customer?.email || '',
-          customerPhone: d.customer?.phone || '',
-          addrLine1: d.address?.line1 || '',
-          addrLine2: d.address?.line2 || '',
-          city: d.address?.city || '',
-          postalCode: d.address?.postalCode || '',
-          country: d.address?.country || '',
-          orderTotal: Number(d.totals?.total || 0),
-          currency: d.totals?.currency || 'TRY',
-          notes: d.notes || ''
-        };
+      return docs.map(d => {
+        const items = Array.isArray(d.items) ? d.items : [];
+        const totals = d.totals || {};
 
-        const items = Array.isArray(d.items) && d.items.length ? d.items : [{sku:'',name:'',qty:'',unitPrice:''}];
-        for (const it of items) {
-          out.push([
-            base.orderNumber, base.createdAt, base.channel,
-            base.customerName, base.customerEmail, base.customerPhone,
-            base.addrLine1, base.addrLine2, base.city, base.postalCode, base.country,
-            it.sku || '', it.name || '', Number(it.qty || 0), Number(it.unitPrice || 0),
-            base.orderTotal, base.currency, base.notes
-          ]);
-        }
-      }
-      return out;
+        return [
+          d.orderNumber || '',
+          d.createdAt ? new Date(d.createdAt).toISOString() : '',
+          d.channel || 'wix',
+          supplier,
+          d.dhlRef || d.referenceId || '',
+          d.customer?.name || '',
+          joinAddr(d.customer),
+          getCity(d),
+          getDistrict(d),
+          getPostcode(d),
+          d.customer?.phone || '',
+          d.customer?.email || '',
+          d.carrier || '',
+          d.trackingNumber || '',
+          d.shippedAt || '',
+          normStatus(d.status) || '',
+          d.deliveredAt || '',
+          '',                                // Kargo Etiket PDF (filled by Sheet)
+          first(items, 'sku', ''),
+          first(items, 'name', ''),
+          Number(first(items, 'unitPrice', 0)) || 0,
+          Number(totals.total ?? 0) || 0,
+          d.notes || ''
+        ];
+      });
     });
 
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
-    res.status(200).json({ ok:true, headers: HEADERS, rows });
+    res.status(200).json({ ok: true, headers: HEADERS, rows });
   } catch (err) {
-    res.status(500).json({ ok:false, error: err.message });
+    res.status(500).json({ ok: false, error: err.message });
   }
 };
