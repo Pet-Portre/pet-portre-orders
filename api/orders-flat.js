@@ -171,28 +171,25 @@ function extractItemFields(doc) {
   };
 }
 
+/** Fallback total = items actually charged + shipping actually charged (no manual discount math) */
 function computeTotalIfMissing(doc) {
   const items = Array.isArray(doc.items) ? doc.items : (Array.isArray(doc.lineItems) ? doc.lineItems : []);
-  let sum = 0;
-  let any = false;
+  let itemsPaid = 0;
+  let anyItem = false;
   for (const it of items) {
     const v = numOrNull(it?.totalPrice?.value) ?? numOrNull(it?.totalPriceBeforeTax?.value);
-    if (v !== null) { sum += v; any = true; }
+    if (v !== null) { itemsPaid += v; anyItem = true; }
   }
-  if (!any) return null;
 
-  const ship = numOrNull(
-    doc.totals?.shipping?.value ??
+  const shipPaid = numOrNull(
     doc.priceSummary?.shipping?.value ??
+    doc.shippingInfo?.totalPriceAfterTax?.value ??
+    doc.totals?.shipping?.value ??
     doc.shippingInfo?.price?.value
   ) ?? 0;
 
-  const disc = numOrNull(
-    doc.totals?.discount?.value ??
-    doc.priceSummary?.discount?.value
-  ) ?? 0;
-
-  return sum + ship - disc;
+  if (!anyItem && shipPaid === 0) return null;
+  return itemsPaid + shipPaid;
 }
 
 function fromTotals(doc) {
@@ -206,7 +203,7 @@ function fromTotals(doc) {
     0
   );
 
-  // ---- ONLY CHANGE: make sure coupon amounts are included in discount ----
+  // discount: includes coupons & per-line discounts; 0 if none
   const discPrimary = pick(
     doc.priceSummary?.discount?.value,
     doc.totals?.discount?.value
@@ -220,17 +217,15 @@ function fromTotals(doc) {
     it => it?.totalDiscount?.value
   );
   const discount = nn(pick(discPrimary, discApplied, discItems), 0);
-  // -----------------------------------------------------------------------
 
-  // total: first canonical totals/priceSummary, else compute, else 0
+  // total: prefer Wix totals; else fallback compute (itemsPaid + shippingPaid)
   let total = pick(
     doc.priceSummary?.total?.value,
     doc.totals?.total?.value,
     doc.orderTotal?.value
   );
   if (!(Number.isFinite(Number(total)))) {
-    const computed = computeTotalIfMissing(doc);
-    total = computed;
+    total = computeTotalIfMissing(doc);
   }
   const totalOut = nn(total, 0);
 
@@ -285,7 +280,7 @@ module.exports = async (req, res) => {
 
     // --- auth ---
     const bearer   = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
-    const provided = req.query.key || req.headers['x-api-key'] || bearer || '';
+    the provided = req.query.key || req.headers['x-api-key'] || bearer || '';
     const expected =
       process.env.EXPORT_TOKEN ||
       process.env.EXPORT_KEY ||
@@ -342,7 +337,7 @@ module.exports = async (req, res) => {
           paymentMethod, totals.shippingFee,
           // 25..29
           dhl.carrier, dhl.tracking, dhl.shippedAt, dhl.status, dhl.deliveredAt,
-          // 30..32  (ONLY these two were adjusted via fromTotals)
+          // 30..32 (total/discount/currency)
           totals.total, totals.discount, totals.currency,
           // 33..35
           notes, email, phone
