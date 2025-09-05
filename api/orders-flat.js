@@ -1,8 +1,192 @@
 // api/orders-flat.js
-// Export orders as [headers, rows] for Google Sheets (FINAL TR headers, includes Telefon)
+// Export flattened orders for Google Sheets
+
+'use strict';
 
 const { withDb } = require('../lib/db');
 
+/** ---------- helpers ---------- */
+const TZ = 'Europe/Istanbul';
+
+function fmtTRDate(d) {
+  if (!d) return '';
+  const dt = new Date(d);
+  // dd.MM.yyyy HH:mm
+  const pad = (n) => String(n).padStart(2, '0');
+  const y = dt.toLocaleString('tr-TR', { timeZone: TZ, year: 'numeric' });
+  const m = pad(Number(dt.toLocaleString('tr-TR', { timeZone: TZ, month: '2-digit' })));
+  const day = pad(Number(dt.toLocaleString('tr-TR', { timeZone: TZ, day: '2-digit' })));
+  const hh = pad(Number(dt.toLocaleString('tr-TR', { timeZone: TZ, hour: '2-digit', hour12: false })));
+  const mm = pad(Number(dt.toLocaleString('tr-TR', { timeZone: TZ, minute: '2-digit' })));
+  return `${day}.${m}.${y} ${hh}:${mm}`;
+}
+
+function n(v) {
+  const x = Number(v);
+  return Number.isFinite(x) ? x : '';
+}
+
+function str(v) {
+  if (v === null || v === undefined) return '';
+  if (typeof v === 'string') return v;
+  return String(v);
+}
+
+function pick(...cands) {
+  for (const c of cands) {
+    if (c !== undefined && c !== null && c !== '') return c;
+  }
+  return undefined;
+}
+
+function getCustomerName(doc) {
+  const c = doc.customer || doc.contact || {};
+  const nameObj = c.name || {};
+  const first = pick(nameObj.first, c.firstName, c.givenName);
+  const last = pick(nameObj.last, c.lastName, c.familyName);
+  const full = pick(c.name, [first, last].filter(Boolean).join(' ').trim());
+  return full || '';
+}
+
+function getEmail(doc) {
+  return (
+    pick(
+      doc.customer?.email,
+      doc.buyerEmail,
+      doc.contact?.email,
+      doc.billingInfo?.contactDetails?.email
+    ) || ''
+  );
+}
+
+function getPhone(doc) {
+  return (
+    pick(
+      doc.shippingInfo?.destination?.contactDetails?.phone,
+      doc.shippingInfo?.contactDetails?.phone,
+      doc.billingInfo?.contactDetails?.phone,
+      doc.contact?.phone,
+      doc.customer?.phone
+    ) || ''
+  );
+}
+
+function getAddress(doc) {
+  // try formatted variants first
+  return (
+    pick(
+      doc.shippingInfo?.address?.formattedAddressLine,
+      doc.shippingInfo?.destination?.address?.formattedAddressLine,
+      doc.contact?.address?.formattedAddress,
+      doc.billingInfo?.address?.formattedAddressLine,
+      doc.address?.formatted,
+      // or compose a simple line
+      (() => {
+        const a =
+          doc.shippingInfo?.address ||
+          doc.shippingInfo?.destination?.address ||
+          doc.billingInfo?.address ||
+          doc.contact?.address ||
+          doc.address ||
+          {};
+        const line = [a.addressLine, a.addressLine2].filter(Boolean).join(' ');
+        const city = a.city || '';
+        const sub = a.subdivision || a.subdivisionFullname || '';
+        const pc = a.postalCode || '';
+        const country = a.countryFullname || a.country || '';
+        const parts = [line, city, sub, pc, country].filter(Boolean);
+        return parts.length ? parts.join(', ') : undefined;
+      })()
+    ) || ''
+  );
+}
+
+function extractItemFields(doc) {
+  const items = Array.isArray(doc.items) ? doc.items : Array.isArray(doc.lineItems) ? doc.lineItems : [];
+  const first = items[0] || {};
+
+  // Try to read options like Beden, Cinsiyet, Renk, Telefon Modeli, Tablo Boyutu
+  const opt = {};
+  const rawOpts =
+    first.options ||
+    first.modifiers ||
+    first.descriptionLines ||
+    first.description ||
+    [];
+
+  const asArray = Array.isArray(rawOpts) ? rawOpts : [];
+  for (const o of asArray) {
+    const label = str(o.name || o.title || o.label || o.option || o.key).toLowerCase();
+    const value = str(o.value || o.text || o.description || o.optionValue);
+    if (!label) continue;
+
+    if (label.includes('beden') || label.includes('size')) opt.beden = value;
+    else if (label.includes('cinsiyet') || label.includes('gender')) opt.cinsiyet = value;
+    else if (label.includes('renk') || label.includes('color')) opt.renk = value;
+    else if (label.includes('telefon') || label.includes('phone')) opt.telefonModeli = value;
+    else if (label.includes('tablo') || label.includes('canvas') || label.includes('boyut') || label.includes('size')) {
+      if (!opt.tabloBoyutu) opt.tabloBoyutu = value;
+    }
+  }
+
+  const qty = pick(first.quantity, first.qty, 1);
+  const unitPrice =
+    pick(first.price, first.unitPrice?.value, first.priceBeforeTax?.value, first.totalPriceBeforeTax?.value && qty ? Number(first.totalPriceBeforeTax.value) / Number(qty) : undefined) || '';
+  const lineTotal =
+    pick(first.totalPrice?.value, first.totalPriceBeforeTax?.value, (unitPrice && qty) ? Number(unitPrice) * Number(qty) : undefined) || '';
+
+  return {
+    sku: str(pick(first.sku, first.code, first.id)),
+    name: str(pick(first.name, first.title, first.description)),
+    qty: n(qty),
+    unitPrice: n(unitPrice),
+    lineTotal: n(lineTotal),
+    ...opt
+  };
+}
+
+function fromTotals(doc) {
+  const ship = pick(
+    doc.totals?.shipping?.value,
+    doc.priceSummary?.shipping?.value,
+    doc.shippingInfo?.price?.value
+  );
+  const discount = pick(
+    doc.totals?.discount?.value,
+    doc.priceSummary?.discount?.value
+  );
+  const total = pick(
+    doc.totals?.total?.value,
+    doc.priceSummary?.total?.value,
+    doc.orderTotal?.value
+  );
+  const currency = pick(
+    doc.currency,
+    doc.totals?.total?.currency,
+    doc.priceSummary?.total?.currency,
+    doc.priceSummary?.subtotal?.currency
+  );
+
+  return {
+    shippingFee: n(ship),
+    discount: n(discount),
+    total: n(total),
+    currency: str(currency || 'TRY')
+  };
+}
+
+function dhlBits(doc) {
+  return {
+    ref: str(pick(doc.dhl?.referenceId, doc.referenceId, doc.dhlReference)),
+    carrier: str(pick(doc.dhl?.carrier, doc.carrier, doc.shippingCarrier)),
+    tracking: str(pick(doc.dhl?.trackingNumber, doc.trackingNumber)),
+    shippedAt: fmtTRDate(pick(doc.shippedAt, doc.fulfilledAt, doc.logistics?.shippedAt)),
+    status: str(pick(doc.deliveryStatus, doc.statusText, doc.trackingStatus)),
+    deliveredAt: fmtTRDate(pick(doc.deliveredAt))
+  };
+}
+
+/** ---------- fixed header order (must match Sheet) ---------- */
 const HEADERS = [
   'Sipariş No','Sipariş Tarihi','Sipariş Kanalı',
   'Tedarikçi Adı','Tedarikçi Sipariş No','Tedarikçi Kargo Firması','Tedarikçi Kargo Takip No','Tedarikçiye Veriliş Tarihi','Tedarikçiden Teslim Tarihi',
@@ -15,176 +199,7 @@ const HEADERS = [
   'Sipariş Toplam Fiyat','İndirim (₺)','Para Birimi','Notlar','E-posta','Telefon'
 ];
 
-// Istanbul date formatting: dd.MM.yyyy HH:mm
-function fmtTRDate(d) {
-  try {
-    const dt = (d instanceof Date) ? d : new Date(d);
-    if (!isFinite(dt)) return '';
-    return new Intl.DateTimeFormat('tr-TR', {
-      timeZone: 'Europe/Istanbul',
-      day: '2-digit', month: '2-digit', year: 'numeric',
-      hour: '2-digit', minute: '2-digit', hour12: false
-    }).format(dt).replace(',', '');
-  } catch { return ''; }
-}
-
-function firstItem(doc) {
-  if (Array.isArray(doc?.items) && doc.items.length) return doc.items[0];
-  if (Array.isArray(doc?.lineItems) && doc.lineItems.length) return doc.lineItems[0];
-  return null;
-}
-
-function val(obj, path, def='') {
-  try {
-    return path.split('.').reduce((a,k)=> (a && a[k] != null ? a[k] : undefined), obj) ?? def;
-  } catch { return def; }
-}
-
-function pickName(doc) {
-  // stored customer name string?
-  const cn = doc?.customer?.name;
-  if (typeof cn === 'string' && cn.trim()) return cn.trim();
-
-  // contact name parts?
-  const first = val(doc, 'contact.name.first', '');
-  const last  = val(doc, 'contact.name.last', '');
-  const joined = [first, last].filter(Boolean).join(' ');
-  if (joined) return joined;
-
-  // shipping contact?
-  const sfirst = val(doc, 'shippingInfo.shippingDestination.contactDetails.firstName', '');
-  const slast  = val(doc, 'shippingInfo.shippingDestination.contactDetails.lastName', '');
-  const sj = [sfirst, slast].filter(Boolean).join(' ');
-  if (sj) return sj;
-
-  // buyerInfo name?
-  const bfirst = val(doc, 'buyerInfo.firstName', '');
-  const blast  = val(doc, 'buyerInfo.lastName', '');
-  const bj = [bfirst, blast].filter(Boolean).join(' ');
-  if (bj) return bj;
-
-  return '';
-}
-
-function pickAddress(doc) {
-  // prefer a formatted address
-  const f1 = val(doc, 'shippingInfo.shippingDestination.formattedAddress', '');
-  const f2 = val(doc, 'contact.address.formattedAddress', '');
-  const f3 = val(doc, 'billingInfo.address.formattedAddressLine', '');
-  const f4 = val(doc, 'address.formattedAddress', ''); // if you ever stored one
-  if (f1 || f2 || f3 || f4) return (f1 || f2 || f3 || f4);
-
-  // otherwise join pieces
-  const parts = [
-    val(doc, 'shippingInfo.shippingDestination.addressLine', ''),
-    val(doc, 'shippingInfo.shippingDestination.addressLine2', ''),
-    val(doc, 'shippingInfo.shippingDestination.city', ''),
-    val(doc, 'shippingInfo.shippingDestination.subdivision', ''),
-    val(doc, 'shippingInfo.shippingDestination.postalCode', ''),
-    val(doc, 'shippingInfo.shippingDestination.countryFullname', '') || val(doc, 'shippingInfo.shippingDestination.country', '')
-  ].filter(Boolean);
-  if (parts.length) return parts.join(', ');
-
-  const cparts = [
-    val(doc, 'contact.address.addressLine', ''),
-    val(doc, 'contact.address.addressLine2', ''),
-    val(doc, 'contact.address.city', ''),
-    val(doc, 'contact.address.subdivision', ''),
-    val(doc, 'contact.address.postalCode', ''),
-    val(doc, 'contact.address.country', '')
-  ].filter(Boolean);
-  if (cparts.length) return cparts.join(', ');
-
-  return '';
-}
-
-function pickPhoneFromDoc(doc) {
-  // prefer value saved by webhook
-  const existing = doc?.customer?.phone;
-  if (existing) return existing;
-
-  // try recomputing from any raw-like fields you might have retained
-  const p =
-    val(doc, 'shippingInfo.shippingDestination.contactDetails.phone', '') ||
-    val(doc, 'billingInfo.contactDetails.phone', '') ||
-    val(doc, 'contact.phone', '') ||
-    val(doc, 'buyerInfo.phone', '');
-
-  const digits = String(p).replace(/\D+/g, '');
-  if (!digits) return '';
-  if (digits.length === 11 && digits.startsWith('0')) return digits;
-  if (digits.length === 10) return '0' + digits;
-  if (digits.length === 12 && digits.startsWith('90')) return '0' + digits.slice(2);
-  return digits;
-}
-
-function pickEmail(doc) {
-  return doc?.customer?.email || doc?.buyerEmail || val(doc, 'contact.email', '') || '';
-}
-
-function pickLineItemFields(li) {
-  if (!li) return { sku:'', name:'', qty:'', unitPrice:'', lineTotal:'', currency:'' };
-
-  const sku = li.sku || li.SKU || li.id || '';
-  const name = li.name || li.title || '';
-  const qty = Number(li.quantity || li.qty || 1) || 1;
-
-  // unit/total prices (handle a bunch of shapes)
-  const lpVal = val(li, 'totalPrice.value', null) ?? val(li, 'price.total.value', null) ?? val(li, 'total.value', null);
-  const upVal = val(li, 'unitPrice.value', null) ?? val(li, 'price.unit.value', null) ?? val(li, 'priceBeforeTax.value', null);
-
-  const currency = val(li, 'totalPrice.currency', '') || val(li, 'price.total.currency', '') || val(li, 'unitPrice.currency', '') || '';
-
-  let unitPrice = (typeof upVal === 'number') ? upVal : '';
-  let lineTotal = (typeof lpVal === 'number') ? lpVal : '';
-
-  if (lineTotal === '' && unitPrice !== '' && qty) lineTotal = +(unitPrice * qty).toFixed(2);
-  if (unitPrice === '' && lineTotal !== '' && qty) unitPrice = +(lineTotal / qty).toFixed(2);
-
-  return { sku, name, qty, unitPrice, lineTotal, currency };
-}
-
-function pickOptionValue(li, names = []) {
-  // Wix "description lines" / options often appear as an array of { name/title, description/value }
-  const lines = li?.descriptionLines || li?.options || li?.customizations || [];
-  const arr = Array.isArray(lines) ? lines : [];
-  const want = names.map(s => String(s).toLowerCase());
-  for (const line of arr) {
-    const key = (line.name || line.title || '').toLowerCase();
-    if (want.includes(key)) return line.description || line.value || '';
-  }
-  return '';
-}
-
-function pickOrderTotals(doc, liCurrency) {
-  // try order-level totals first
-  const total = val(doc, 'totals.total.value', null) ?? val(doc, 'priceSummary.total.value', null);
-  const disc  = val(doc, 'totals.discount.value', null) ?? val(doc, 'priceSummary.discount.value', null);
-  const cur   = val(doc, 'totals.total.currency', '')  || val(doc, 'priceSummary.total.currency', '')  || doc.currency || liCurrency || 'TRY';
-
-  return {
-    total: (typeof total === 'number') ? total : '',
-    discount: (typeof disc === 'number') ? disc : '',
-    currency: cur
-  };
-}
-
-function pickShipping(doc) {
-  const fee = val(doc, 'totals.shipping.value', null) ?? val(doc, 'priceSummary.shipping.value', null);
-  return (typeof fee === 'number') ? fee : '';
-}
-
-function pickPaymentMethod(doc) {
-  // best-effort; many payloads lack provider name in what you saved
-  return doc.paymentMethod || doc.paymentProvider || doc.paymentStatus || '';
-}
-
-function pickCarrier(doc) { return doc.carrier || ''; }
-function pickTracking(doc) { return doc.trackingNumber || ''; }
-function pickShippedAt(doc){ return doc.shippedAt ? fmtTRDate(doc.shippedAt) : ''; }
-function pickDelivStatus(doc){ return doc.deliveryStatus || ''; }
-function pickDeliveredAt(doc){ return doc.deliveredAt ? fmtTRDate(doc.deliveredAt) : ''; }
-
+/** ---------- handler ---------- */
 module.exports = async (req, res) => {
   try {
     if (req.method !== 'GET') {
@@ -192,81 +207,125 @@ module.exports = async (req, res) => {
       return res.status(405).send('GET only — orders-flat');
     }
 
-    const key = req.query.key || '';
-    const expected = process.env.EXPORT_KEY || process.env.ORDERS_EXPORT_KEY || process.env.WIX_EXPORT_KEY || '';
-    if (!expected || key !== expected) {
+    // --- auth ---
+    const bearer = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
+    const provided =
+      req.query.key ||
+      req.headers['x-api-key'] ||
+      bearer ||
+      '';
+    const expected =
+      process.env.EXPORT_TOKEN ||      // <-- your env var
+      process.env.EXPORT_KEY ||
+      process.env.ORDERS_EXPORT_KEY ||
+      process.env.WIX_EXPORT_KEY ||
+      '';
+
+    if (!expected || provided !== expected) {
       return res.status(401).json({ ok: false, error: 'Unauthorized' });
     }
 
-    const rows = await withDb(async (db) => {
+    // --- read orders ---
+    const { rows } = await withDb(async (db) => {
       const col = db.collection('orders');
-      const docs = await col.find({}).sort({ createdAt: -1, _id: -1 }).toArray();
+      const docs = await col
+        .find({})
+        .sort({ createdAt: -1 })
+        .limit(2000)
+        .toArray();
 
-      return docs.map(doc => {
-        const li = firstItem(doc);
-        const { sku, name, qty, unitPrice, lineTotal, currency: liCurrency } = pickLineItemFields(li);
-        const { total: orderTotal, discount, currency: orderCur } = pickOrderTotals(doc, liCurrency);
+      const out = docs.map((doc) => {
+        const orderNo = str(
+          doc.orderNumber || doc.number || doc.id || doc._id?.toString() || ''
+        );
+        const created = fmtTRDate(
+          doc.createdAt || doc.createdDate || doc._createdByWebhookAt
+        );
+        const channel = str((doc.channel || 'wix').toString().toLowerCase());
 
-        const row = [];
+        // supplier editable block is blank
+        const supplier = ['', '', '', '', ''];
 
-        // 1..3
-        row.push(doc.orderNumber || '');
-        row.push(fmtTRDate(doc.createdAt));
-        row.push(doc.channel || 'wix');
+        const dhl = dhlBits(doc);
+        const customerName = getCustomerName(doc);
+        const address = getAddress(doc);
 
-        // 4..9 supplier editable block -> leave blank; Apps Script preserves edits anyway
-        row.push(''); row.push(''); row.push(''); row.push(''); row.push(''); row.push('');
+        const item = extractItemFields(doc);
+        const totals = fromTotals(doc);
 
-        // 10 DHL ref
-        row.push(doc.dhlRef || '');
+        const paymentMethod = str(
+          pick(
+            doc.payment?.method,
+            doc.paymentMethod,
+            doc.payments?.[0]?.method,
+            doc.priceSummary?.paymentMethod
+          ) || ''
+        );
 
-        // 11..12 customer name + address
-        row.push(pickName(doc));
-        row.push(pickAddress(doc));
+        const email = getEmail(doc);
+        const phone = getPhone(doc);
 
-        // 13..17 line item basics
-        row.push(sku);
-        row.push(name);
-        row.push(qty);
-        row.push(unitPrice);
-        row.push(lineTotal);
+        const notes = str(doc.notes || '');
 
-        // 18..22 options
-        row.push(pickOptionValue(li, ['Beden', 'Size']));
-        row.push(pickOptionValue(li, ['Cinsiyet', 'Gender']));
-        row.push(pickOptionValue(li, ['Renk', 'Color']));
-        row.push(pickOptionValue(li, ['Telefon Modeli', 'Phone Model']));
-        row.push(pickOptionValue(li, ['Tablo Boyutu', 'Canvas Size', 'Boyut']));
+        return [
+          // 1..3
+          orderNo,
+          created,
+          channel,
 
-        // 23..24 payment + shipping fee
-        row.push(pickPaymentMethod(doc));
-        row.push(pickShipping(doc));
+          // 4..8 (supplier-editable placeholders)
+          ...supplier,
 
-        // 25..29 shipping tracking/status
-        row.push(pickCarrier(doc));
-        row.push(pickTracking(doc));
-        row.push(pickShippedAt(doc));
-        row.push(pickDelivStatus(doc));
-        row.push(pickDeliveredAt(doc));
+          // 9
+          dhl.ref,
 
-        // 30..35 totals, currency, notes, email, phone
-        row.push(orderTotal);
-        row.push(discount);
-        row.push(orderCur || liCurrency || doc.currency || 'TRY');
-        row.push(doc.notes || '');
-        row.push(pickEmail(doc));
-        row.push(pickPhoneFromDoc(doc));
+          // 10..12
+          customerName,
+          address,
 
-        return row;
+          // 13..17
+          item.sku,
+          item.name,
+          item.qty,
+          item.unitPrice,
+          item.lineTotal,
+
+          // 18..22
+          item.beden || '',
+          item.cinsiyet || '',
+          item.renk || '',
+          item.telefonModeli || '',
+          item.tabloBoyutu || '',
+
+          // 23..24
+          paymentMethod,
+          totals.shippingFee,
+
+          // 25..29
+          dhl.carrier,
+          dhl.tracking,
+          dhl.shippedAt,
+          dhl.status,
+          dhl.deliveredAt,
+
+          // 30..32
+          totals.total,
+          totals.discount,
+          totals.currency,
+
+          // 33..35
+          notes,
+          email,
+          phone
+        ];
       });
+
+      return { rows: out };
     });
 
-    return res.json({
-      ok: true,
-      headers: HEADERS,
-      rows
-    });
+    return res.json({ ok: true, headers: HEADERS, rows });
   } catch (err) {
+    console.error('orders-flat error:', err);
     return res.status(500).json({ ok: false, error: err.message });
   }
 };
