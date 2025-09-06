@@ -1,7 +1,9 @@
 // api/dhl-label.js
+// Generate DHL (MNG) label (PDF base64) for a given referenceId
+
 'use strict';
 
-const OK   = (res, data) => res.status(200).json({ ok: true,  ...data });
+const OK   = (res, data) => res.status(200).json({ ok: true, ...data });
 const FAIL = (res, code, msg) => res.status(code).json({ ok: false, error: msg || 'Error' });
 
 async function jfetch(url, opt = {}) {
@@ -13,7 +15,28 @@ async function jfetch(url, opt = {}) {
   });
   const text = await r.text();
   let json; try { json = text ? JSON.parse(text) : {}; } catch { json = { raw: text }; }
-  return { status: r.status, ok: r.ok, json };
+  return { ok: r.ok, status: r.status, json };
+}
+
+async function getJwt() {
+  const url = process.env.DHL_GET_TOKEN_URL;                // https://testapi.mngkargo.com.tr/mngapi/api/token
+  if (!url) throw new Error('Missing DHL_GET_TOKEN_URL');
+  const r = await jfetch(url, {
+    // IMPORTANT: token endpoint wants ONLY headers (no body)
+    headers: {
+      'x-ibm-client-id':     process.env.DHL_API_KEY,
+      'x-ibm-client-secret': process.env.DHL_API_SECRET,
+      'Accept': 'application/json'
+    }
+  });
+  if (!r.ok || !r.json?.accessToken) {
+    throw new Error('Token failed: ' + JSON.stringify(r.json));
+  }
+  return r.json.accessToken;
+}
+
+function pickLabelBase64(payload) {
+  return payload?.labelBase64 || payload?.base64 || payload?.data?.base64 || payload?.data || '';
 }
 
 module.exports = async (req, res) => {
@@ -23,47 +46,61 @@ module.exports = async (req, res) => {
       return res.status(405).send('POST only — dhl-label');
     }
 
-    // ✅ Accept either WIX token (what the Sheet sends) OR DHL_API_KEY
+    // Accept either WIX webhook token or export token for this route (not your MNG creds).
     const provided = req.headers['x-api-key'] || '';
-    const allow = [process.env.WIX_WEBHOOK_TOKEN, process.env.DHL_API_KEY].filter(Boolean);
-    if (!allow.includes(provided)) return FAIL(res, 401, 'Unauthorized');
+    const expectedA = process.env.WIX_WEBHOOK_TOKEN || '';
+    const expectedB = process.env.EXPORT_TOKEN || '';
+    if (!provided || (provided !== expectedA && provided !== expectedB)) {
+      return FAIL(res, 401, 'Unauthorized');
+    }
 
     const { referenceId, labelType = 'PDF', paperSize = 'A6' } = (req.body || {});
     if (!referenceId) return FAIL(res, 400, 'referenceId required');
 
-    // 1) Get JWT (NO BODY)
-    const tok = await jfetch(process.env.DHL_GET_TOKEN_URL, {
-      headers: {
-        'Content-Type': 'application/json',
-        'Accept': 'application/json',
-        'x-ibm-client-id':     process.env.DHL_API_KEY,
-        'x-ibm-client-secret': process.env.DHL_API_SECRET,
-      }
-    });
-    if (!tok.ok || !tok.json?.accessToken) return FAIL(res, 502, 'Token failed');
-    const jwt = tok.json.accessToken;
+    const jwt = await getJwt();
 
-    // 2) Ask for label (try explicit then fallbacks)
-    const explicit = (process.env.DHL_LABEL_URL || '').replace(/\/+$/, '');
-    const baseSQ   = (process.env.DHL_STANDARD_QUERY_URL || '').replace(/\/+$/, '');
-    const attempts = [
-      { url: explicit,                    body: { barcode: referenceId, labelType, paperSize } },
-      { url: `${baseSQ}/getLabel`,        body: { barcode: referenceId, labelType, paperSize } },
-      { url: `${baseSQ}/printLabel`,      body: { barcode: referenceId, labelType, paperSize } },
-      { url: `${baseSQ}/getLabelByReferenceId`, body: { referenceId, labelType, paperSize } },
-    ].filter(a => a.url && a.url.startsWith('http'));
-
-    let got;
-    for (const a of attempts) {
-      const r = await jfetch(a.url, { headers: { Authorization: `Bearer ${jwt}`, 'Accept':'application/json' }, body: a.body });
-      if (r.ok && (r.json?.labelBase64 || r.json?.base64 || r.json?.data)) { got = r.json; break; }
+    // Build candidate endpoints (prefer explicit env)
+    const urls = [];
+    if (process.env.DHL_LABEL_URL) {
+      urls.push(process.env.DHL_LABEL_URL.replace(/\/+$/, '')); // e.g. .../barcodecmdapi/getLabel
     }
-    if (!got) return FAIL(res, 502, 'Label not returned');
+    const baseStd = (process.env.DHL_STANDARD_QUERY_URL || '').replace(/\/+$/, ''); // .../standardqueryapi
+    if (baseStd) urls.push(baseStd + '/getLabel');
 
-    const base64 = got.labelBase64 || got.base64 || got.data?.base64 || got.data || '';
-    if (!base64 || typeof base64 !== 'string') return FAIL(res, 502, 'Invalid label payload');
+    // Fallbacks for tenants exposing different shapes
+    if (baseStd) urls.push(baseStd + '/printLabel', baseStd + '/getLabelByReferenceId');
+    if (urls.length === 0) return FAIL(res, 500, 'No label URL configured');
 
-    return OK(res, { base64, fileName: `${referenceId}.pdf` });
+    let lastErr = null;
+    for (const url of urls) {
+      // Try by barcode (your createOrder uses barcode=WIXxxxxx)
+      let r = await jfetch(url, {
+        headers: { Authorization: `Bearer ${jwt}`, Accept: 'application/json' },
+        body: { barcode: referenceId, labelType, paperSize }
+      });
+      if (r.ok) {
+        const b64 = pickLabelBase64(r.json);
+        if (typeof b64 === 'string' && b64.length > 0) {
+          const fileName = `${referenceId}.pdf`;
+          return OK(res, { base64: b64, fileName });
+        }
+      }
+      // Try by referenceId if API expects that
+      r = await jfetch(url, {
+        headers: { Authorization: `Bearer ${jwt}`, Accept: 'application/json' },
+        body: { referenceId, labelType, paperSize }
+      });
+      if (r.ok) {
+        const b64 = pickLabelBase64(r.json);
+        if (typeof b64 === 'string' && b64.length > 0) {
+          const fileName = `${referenceId}.pdf`;
+          return OK(res, { base64: b64, fileName });
+        }
+      }
+      lastErr = r.json;
+    }
+
+    return FAIL(res, 502, 'Label not returned: ' + JSON.stringify(lastErr || {}));
   } catch (err) {
     console.error('dhl-label error:', err);
     return FAIL(res, 500, err.message || 'Server error');
