@@ -12,7 +12,6 @@ async function jfetch(url, opt = {}) {
     method: opt.method || 'POST',
     headers: { 'content-type': 'application/json', ...(opt.headers || {}) },
     body: opt.body ? JSON.stringify(opt.body) : undefined,
-    // avoid caching on Vercel edge/CDN
     cache: 'no-store',
   });
   const text = await r.text();
@@ -28,7 +27,7 @@ module.exports = async (req, res) => {
       return res.status(405).send('POST only — dhl-label');
     }
 
-    // simple api-key gate (same as your other routes)
+    // simple api-key gate (same style as your other routes)
     const provided = req.headers['x-api-key'] || '';
     const expected = process.env.DHL_API_KEY || process.env.WIX_WEBHOOK_TOKEN || '';
     if (!expected || provided !== expected) {
@@ -37,11 +36,20 @@ module.exports = async (req, res) => {
 
     const {
       referenceId,
-      labelType = 'PDF',   // MNG accepts PDF/ZPL; you’re using PDF
-      paperSize = 'A6',    // A6 is what your script sends
+      labelType = 'PDF',   // your Sheet sends 'PDF'
+      paperSize = 'A6',    // your Sheet sends 'A6'
     } = (req.body || {});
-
     if (!referenceId) return FAIL(res, 400, 'referenceId required');
+
+    // Map to MNG enum codes
+    const lt = String(labelType).toUpperCase();
+    const ps = String(paperSize).toUpperCase();
+    const labelTypeCode = (lt === 'ZPL') ? 2 : 1; // PDF=1, ZPL=2
+    const paperSizeCode =
+      ps === 'A4' ? 1 :
+      ps === 'A5' ? 2 :
+      ps === 'A6' ? 4 :
+      (/^\d+$/.test(ps) ? Number(ps) : 4); // default A6
 
     // 1) Get JWT from MNG
     const tokenResp = await jfetch(process.env.DHL_GET_TOKEN_URL, {
@@ -60,40 +68,36 @@ module.exports = async (req, res) => {
     }
     const jwt = tokenResp.json.accessToken;
 
-    // 2) Ask label from Standard Query API
-    // Some tenants expose label under different paths. We’ll try a couple.
-    const base = process.env.DHL_STANDARD_QUERY_URL?.replace(/\/+$/, '') || '';
-    const attempts = [
-      { url: `${base}/getLabel`, body: { barcode: referenceId, labelType, paperSize } },
-      { url: `${base}/printLabel`, body: { barcode: referenceId, labelType, paperSize } },
-      { url: `${base}/getLabelByReferenceId`, body: { referenceId, labelType, paperSize } },
-    ];
+    // 2) Call label endpoint (use your configured label URL)
+    const labelUrl = (process.env.DHL_LABEL_URL || '').replace(/\/+$/, '');
+    if (!labelUrl) return FAIL(res, 500, 'DHL_LABEL_URL missing');
 
-    let got;
-    for (const a of attempts) {
-      const r = await jfetch(a.url, {
-        headers: { Authorization: `Bearer ${jwt}` },
-        body: a.body,
-      });
-      if (r.ok && (r.json?.labelBase64 || r.json?.base64 || r.json?.data)) {
-        got = r.json;
-        break;
-      }
+    const labelResp = await jfetch(labelUrl, {
+      headers: { Authorization: `Bearer ${jwt}` },
+      body: {
+        barcode: referenceId,
+        labelType: labelTypeCode,
+        paperSize: paperSizeCode
+      },
+    });
+
+    if (!labelResp.ok) {
+      const msg = labelResp.json?.message || labelResp.json?.error || 'Label fetch failed';
+      return FAIL(res, labelResp.status, msg);
     }
 
-    if (!got) return FAIL(res, 502, 'Label not returned');
-
     const base64 =
-      got.labelBase64 || got.base64 || got.data?.base64 || got.data || '';
+      labelResp.json?.labelBase64 ||
+      labelResp.json?.base64 ||
+      labelResp.json?.data ||
+      labelResp.json?.pdfBase64 ||
+      '';
 
     if (!base64 || typeof base64 !== 'string') {
       return FAIL(res, 502, 'Invalid label payload');
     }
 
-    // filename hint for Drive
-    const fileName = `${referenceId}.pdf`;
-
-    return OK(res, { base64, fileName });
+    return OK(res, { base64, fileName: `${referenceId}.pdf` });
   } catch (err) {
     console.error('dhl-label error:', err);
     return FAIL(res, 500, err.message || 'Server error');
