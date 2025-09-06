@@ -12,7 +12,7 @@ async function jfetch(url, opt = {}) {
     method: opt.method || 'POST',
     headers: { 'content-type': 'application/json', ...(opt.headers || {}) },
     body: opt.body ? JSON.stringify(opt.body) : undefined,
-    cache: 'no-store',
+    cache: 'no-store', // avoid CDN caching on Vercel
   });
   const text = await r.text();
   let json;
@@ -27,40 +27,35 @@ module.exports = async (req, res) => {
       return res.status(405).send('POST only — dhl-label');
     }
 
-    // simple api-key gate (same style as your other routes)
+    // --- accept either WIX_WEBHOOK_TOKEN or DHL_API_KEY (IBM client id) ---
     const provided = req.headers['x-api-key'] || '';
-    const expected = process.env.DHL_API_KEY || process.env.WIX_WEBHOOK_TOKEN || '';
-    if (!expected || provided !== expected) {
+    const allowedKeys = [
+      process.env.WIX_WEBHOOK_TOKEN,
+      process.env.EXPORT_TOKEN,          // optional: your internal export key
+      process.env.DHL_API_KEY            // IBM client id
+    ].filter(Boolean);
+    if (!allowedKeys.includes(provided)) {
       return FAIL(res, 401, 'Unauthorized');
     }
 
     const {
       referenceId,
-      labelType = 'PDF',   // your Sheet sends 'PDF'
-      paperSize = 'A6',    // your Sheet sends 'A6'
+      labelType = 'PDF',   // PDF or ZPL
+      paperSize = 'A6',    // A6 as used by your sheet
     } = (req.body || {});
-    if (!referenceId) return FAIL(res, 400, 'referenceId required');
 
-    // Map to MNG enum codes
-    const lt = String(labelType).toUpperCase();
-    const ps = String(paperSize).toUpperCase();
-    const labelTypeCode = (lt === 'ZPL') ? 2 : 1; // PDF=1, ZPL=2
-    const paperSizeCode =
-      ps === 'A4' ? 1 :
-      ps === 'A5' ? 2 :
-      ps === 'A6' ? 4 :
-      (/^\d+$/.test(ps) ? Number(ps) : 4); // default A6
+    if (!referenceId) return FAIL(res, 400, 'referenceId required');
 
     // 1) Get JWT from MNG
     const tokenResp = await jfetch(process.env.DHL_GET_TOKEN_URL, {
       headers: {
-        'x-ibm-client-id': process.env.DHL_API_KEY,
+        'x-ibm-client-id':     process.env.DHL_API_KEY,
         'x-ibm-client-secret': process.env.DHL_API_SECRET,
       },
       body: {
         customerNumber: process.env.DHL_CUSTOMER_NUMBER,
-        password: process.env.DHL_CUSTOMER_PASSWORD,
-        identityType: Number(process.env.DHL_IDENTITY_TYPE || 1),
+        password:       process.env.DHL_CUSTOMER_PASSWORD,
+        identityType:   Number(process.env.DHL_IDENTITY_TYPE || 1),
       },
     });
     if (!tokenResp.ok || !tokenResp.json?.accessToken) {
@@ -68,36 +63,37 @@ module.exports = async (req, res) => {
     }
     const jwt = tokenResp.json.accessToken;
 
-    // 2) Call label endpoint (use your configured label URL)
-    const labelUrl = (process.env.DHL_LABEL_URL || '').replace(/\/+$/, '');
-    if (!labelUrl) return FAIL(res, 500, 'DHL_LABEL_URL missing');
+    // 2) Ask label from Standard Query API
+    const base = (process.env.DHL_STANDARD_QUERY_URL || '').replace(/\/+$/, '');
+    const attempts = [
+      { url: `${base}/getLabel`,                 body: { barcode: referenceId, labelType, paperSize } },
+      { url: `${base}/printLabel`,               body: { barcode: referenceId, labelType, paperSize } },
+      { url: `${base}/getLabelByReferenceId`,    body: { referenceId, labelType, paperSize } },
+    ];
 
-    const labelResp = await jfetch(labelUrl, {
-      headers: { Authorization: `Bearer ${jwt}` },
-      body: {
-        barcode: referenceId,
-        labelType: labelTypeCode,
-        paperSize: paperSizeCode
-      },
-    });
-
-    if (!labelResp.ok) {
-      const msg = labelResp.json?.message || labelResp.json?.error || 'Label fetch failed';
-      return FAIL(res, labelResp.status, msg);
+    let got;
+    for (const a of attempts) {
+      const r = await jfetch(a.url, {
+        headers: { Authorization: `Bearer ${jwt}` },
+        body: a.body,
+      });
+      if (r.ok && (r.json?.labelBase64 || r.json?.base64 || r.json?.data)) {
+        got = r.json;
+        break;
+      }
     }
 
+    if (!got) return FAIL(res, 502, 'Label not returned');
+
     const base64 =
-      labelResp.json?.labelBase64 ||
-      labelResp.json?.base64 ||
-      labelResp.json?.data ||
-      labelResp.json?.pdfBase64 ||
-      '';
+      got.labelBase64 || got.base64 || got.data?.base64 || got.data || '';
 
     if (!base64 || typeof base64 !== 'string') {
       return FAIL(res, 502, 'Invalid label payload');
     }
 
-    return OK(res, { base64, fileName: `${referenceId}.pdf` });
+    const fileName = `${referenceId}.pdf`;
+    return OK(res, { base64, fileName });
   } catch (err) {
     console.error('dhl-label error:', err);
     return FAIL(res, 500, err.message || 'Server error');
