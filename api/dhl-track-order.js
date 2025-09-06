@@ -1,174 +1,92 @@
-// pages/api/dhl-track-order.js
-
-const BASE = (process.env.DHL_BASE_URL || 'https://testapi.mngkargo.com.tr/mngapi/api').replace(/\/+$/, '');
-const KEY  = process.env.DHL_API_KEY || '';
-const SEC  = process.env.DHL_API_SECRET || '';
-
-// Optional: public tracking page base (adjust if your team uses a different one)
-const PUBLIC_TRACK_BASE = (process.env.DHL_PUBLIC_TRACK_BASE || 'https://selfservis.mngkargo.com.tr/GonderiTakip/?TakipNo=').replace(/\/+$/, '') + (process.env.DHL_PUBLIC_TRACK_BASE ? '' : '');
-
-let cachedToken = null; // { token, exp }
-
-// seconds
-const now = () => Math.floor(Date.now() / 1000);
-
-async function getToken() {
-  if (cachedToken && cachedToken.exp - 60 > now()) return cachedToken.token;
-
-  const url = `${BASE}/token`;
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      'x-ibm-client-id': KEY,
-      'x-ibm-client-secret': SEC,
-      'accept': 'application/json'
-    },
-    body: '{}'
-  });
-
-  if (!res.ok) {
-    const txt = await res.text();
-    throw new Error(`Token failed → ${res.status} ${txt}`);
-  }
-
-  const json = await res.json();
-  const token = json?.accessToken || json?.token || '';
-  if (!token) throw new Error('Token missing in response');
-
-  // cache until JWT exp, fallback ~20m
-  const parts = token.split('.');
-  try {
-    const payload = JSON.parse(Buffer.from(parts[1], 'base64').toString('utf8'));
-    cachedToken = { token, exp: Number(payload.exp) || now() + 1200 };
-  } catch {
-    cachedToken = { token, exp: now() + 1200 };
-  }
-  return token;
-}
-
-async function stdGet(path, token) {
-  const url = `${BASE}/standardqueryapi${path}`;
-  const res = await fetch(url, {
-    method: 'GET',
-    headers: {
-      'authorization': `Bearer ${token}`,
-      'x-ibm-client-id': KEY,
-      'x-ibm-client-secret': SEC,
-      'accept': 'application/json'
-    }
-  });
-
-  const text = await res.text();
-  let data = null;
-  try { data = text ? JSON.parse(text) : null; } catch { data = text; }
-
-  return { ok: res.ok, status: res.status, data };
-}
-
-function pickStatus(payload) {
-  const out = {};
-  const shipment = payload?.shipment || payload?.Shipment || payload;
-  const order    = payload?.order || payload?.Order || payload;
-
-  out.trackingNumber =
-    shipment?.shipmentNumber ||
-    shipment?.shipmentId ||
-    order?.shipmentNumber ||
-    order?.shipmentId ||
-    payload?.shipmentNumber ||
-    payload?.shipmentId;
-
-  out.status =
-    payload?.status ||
-    payload?.statusName ||
-    payload?.currentStatus ||
-    shipment?.status ||
-    shipment?.statusName ||
-    order?.status ||
-    order?.statusName;
-
-  out.deliveredAt =
-    payload?.deliveredAt ||
-    payload?.deliveryDate ||
-    shipment?.deliveredAt ||
-    shipment?.deliveryDate ||
-    order?.deliveredAt ||
-    order?.deliveryDate;
-
-  if (out.status) {
-    const s = String(out.status).toUpperCase();
-    if (s.includes('DELIVER')) out.status = 'DELIVERED';
-    else if (s.includes('DAGITIM') || s.includes('OUT FOR')) out.status = 'OUT_FOR_DELIVERY';
-    else if (s.includes('TRANSIT')) out.status = 'IN_TRANSIT';
-    else if (s.includes('CREATED') || s.includes('ORDER')) out.status = 'CREATED';
-  }
-
-  if (out.trackingNumber) {
-    out.trackingUrl = PUBLIC_TRACK_BASE
-      ? `${PUBLIC_TRACK_BASE}${encodeURIComponent(String(out.trackingNumber))}`
-      : null;
-  }
-
-  return out;
-}
+// /api/public-track.js  (Vercel serverless function – production)
 
 export default async function handler(req, res) {
+  // CORS for Wix
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') return res.status(204).end();
+  if (req.method !== 'GET') return res.status(405).json({ ok:false, code:'METHOD_NOT_ALLOWED' });
+
   try {
-    if (req.method !== 'GET') return res.status(405).json({ ok: false, error: 'Method not allowed' });
+    const order = (req.query.order || '').toString().trim();
+    const emailRaw = (req.query.email || '').toString().trim();
+    if (!order || !emailRaw) {
+      return res.status(400).json({ ok:false, code:'BAD_REQUEST' });
+    }
 
-    const ref = (req.query.ref || '').toString().trim();
-    const tracking = (req.query.tracking || '').toString().trim();
-    if (!ref && !tracking) return res.status(400).json({ ok: false, error: 'Pass ?ref= or ?tracking=' });
+    // ---- config (env) ----
+    const SELF = process.env.SELF_BASE_URL || 'https://pet-portre-orders.vercel.app';
+    const EXPORT_KEY = process.env.EXPORT_KEY; // required for /api/orders-flat
+    const DHL_PUBLIC = process.env.DHL_PUBLIC_TRACK_BASE
+      || 'https://selfservis.mngkargo.com.tr/GonderiTakip/?TakipNo=';
 
-    const token = await getToken();
-
-    let best = null;
-    const tryPath = async (p) => {
-      const r = await stdGet(p, token);
-      if (r.ok && r.data) {
-        const picked = pickStatus(r.data);
-        if (!best || picked.status || picked.trackingNumber || picked.deliveredAt) {
-          best = { ...best, ...picked };
-        }
+    // Normalise gmail/googlemail, remove dots and +tags for gmail
+    const canonicalEmail = (raw) => {
+      let e = String(raw).trim().toLowerCase();
+      const at = e.lastIndexOf('@');
+      if (at === -1) return e;
+      let local = e.slice(0, at);
+      let domain = e.slice(at + 1);
+      if (domain === 'googlemail.com') domain = 'gmail.com';
+      if (domain === 'gmail.com') {
+        local = local.split('+')[0].replace(/\./g, '');
       }
-      return r;
+      return `${local}@${domain}`;
     };
+    const email = canonicalEmail(emailRaw);
 
-    // by shipmentId
-    if (tracking) {
-      await tryPath(`/trackshipmentByShipmentId/${encodeURIComponent(tracking)}`);
-      await tryPath(`/getshipmentstatusByShipmentId/${encodeURIComponent(tracking)}`);
-      await tryPath(`/getshipmentByShipmentId/${encodeURIComponent(tracking)}`);
+    // ---- fetch your exporter (server-side) ----
+    const url = `${SELF}/api/orders-flat?key=${encodeURIComponent(EXPORT_KEY)}`;
+    const r = await fetch(url, { cache: 'no-store' });
+    if (!r.ok) throw new Error(`exporter ${r.status}`);
+    const payload = await r.json(); // { ok, headers, rows }
+    if (!payload || !payload.ok) throw new Error('export payload');
+
+    const headers = payload.headers || [];
+    const rows = payload.rows || [];
+    const H = Object.fromEntries(headers.map((n, i) => [n, i]));
+
+    const IDX_NO    = H['Sipariş No'];
+    const IDX_EMAIL = H['E-posta'];
+    const IDX_TRACK = H['Kargo Takip No'];
+    const IDX_REF   = H['DHL Referans No'];
+
+    if ([IDX_NO, IDX_EMAIL].some(i => typeof i !== 'number')) {
+      return res.status(500).json({ ok:false, code:'MISSING_COLUMNS' });
     }
 
-    // by reference
-    if (ref) {
-      const orderR = await tryPath(`/getorder/${encodeURIComponent(ref)}`);
-      let discovered;
-      if (orderR.ok) {
-        const d = (orderR.data?.order || orderR.data || {});
-        discovered = d.shipmentId || d.shipmentNumber;
-      }
-      if (discovered) {
-        await tryPath(`/trackshipmentByShipmentId/${encodeURIComponent(discovered)}`);
-        await tryPath(`/getshipmentstatusByShipmentId/${encodeURIComponent(discovered)}`);
-        await tryPath(`/getshipmentByShipmentId/${encodeURIComponent(discovered)}`);
-      } else {
-        await tryPath(`/trackshipment/${encodeURIComponent(ref)}`);
-        await tryPath(`/getshipmentstatus/${encodeURIComponent(ref)}`);
-        await tryPath(`/getshipment/${encodeURIComponent(ref)}`);
-      }
+    // Match by order number (string compare, exact)
+    const candidates = rows.filter(r => String(r[IDX_NO] || '').trim() === order);
+    if (candidates.length === 0) {
+      // Truly not in export → wrong info
+      return res.status(404).json({ ok:false, code:'NOT_FOUND' });
     }
 
-    if (best && (best.status || best.trackingNumber || best.deliveredAt)) {
-      return res.status(200).json({ ok: true, ...best });
+    // If multiple rows share the same number, prefer the one whose email matches canonically.
+    let row = candidates[0];
+    const match = candidates.find(r => canonicalEmail(String(r[IDX_EMAIL] || '')) === email);
+    if (match) row = match;
+
+    const rowEmail   = canonicalEmail(String(row[IDX_EMAIL] || ''));
+    const tracking   = String(row[IDX_TRACK] || '').trim();
+    const reference  = String(row[IDX_REF] || '').trim();
+
+    // If we have a tracking number AND the email matches → ready (send public URL)
+    if (tracking && rowEmail === email) {
+      return res.status(200).json({
+        ok: true,
+        stage: 'ready',
+        trackingNumber: tracking,
+        referenceId: reference || null,
+        publicUrl: DHL_PUBLIC + encodeURIComponent(tracking)
+      });
     }
 
-    // sandbox-friendly fallback
-    return res.status(200).json({ ok: true, status: 'CREATED' });
+    // Known order (so do NOT scare the customer) → processing
+    return res.status(200).json({ ok: true, stage: 'processing' });
+
   } catch (e) {
-    console.error('track-order error', e);
-    return res.status(200).json({ ok: false, error: String(e?.message || e) });
+    return res.status(500).json({ ok:false, code:'SERVER_ERROR', detail:String(e?.message || e) });
   }
 }
